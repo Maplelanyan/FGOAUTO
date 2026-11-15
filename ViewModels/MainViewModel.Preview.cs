@@ -28,6 +28,7 @@ public partial class MainViewModel
     private long _loggedAllocatedBytes;
     private TimeSpan _loggedGcPause;
     private int _loggedGen2Collections;
+    private ProcessResourceMonitor? _resources;
 
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(DisplayedPreviewImage))]
@@ -48,6 +49,7 @@ public partial class MainViewModel
         _previewFpsClock.Start();
         _lastPerformanceLogTimestamp = Stopwatch.GetTimestamp();
         ResetProcessMetricsBaseline();
+        _resources = new ProcessResourceMonitor(() => _emulator.RuntimeProcessId);
         _previewTimer = new DispatcherTimer(DispatcherPriority.Background)
         {
             Interval = TimeSpan.FromSeconds(1),
@@ -58,7 +60,8 @@ public partial class MainViewModel
 
     private void OnEmulatorFrameAvailable()
     {
-        if (_previewDisposed || IsSelectingTemplate || Interlocked.CompareExchange(ref _previewDispatchPending, 1, 0) != 0) return;
+        if (_previewDisposed || IsSelectingTemplate || _emulator.Diagnostics.IsPreviewPaused
+            || Interlocked.CompareExchange(ref _previewDispatchPending, 1, 0) != 0) return;
         Dispatcher.UIThread.Post(() =>
         {
             try { RenderLatestEmulatorFrame(); }
@@ -75,9 +78,11 @@ public partial class MainViewModel
 
     private void RenderLatestEmulatorFrame()
     {
-        if (_previewDisposed || IsSelectingTemplate) return;
+        if (_previewDisposed || IsSelectingTemplate || _emulator.Diagnostics.IsPreviewPaused) return;
         using var frame = _emulator.TakeLatestPreviewFrame();
         if (frame is null) return;
+        var wasInteractiveReady = _uploadedFrameReceivedAt > 0
+            && _uploadedFrameReceivedAt >= _emulator.PreviewInteractionAfterTimestamp;
 
         var copyStartedAt = Stopwatch.GetTimestamp();
         if (LivePreviewImage is null || LivePreviewImage.PixelSize != new PixelSize(frame.Width, frame.Height))
@@ -105,12 +110,14 @@ public partial class MainViewModel
             _uploadedFrameReceivedAt = frame.ReceivedAtTimestamp;
         }
         LivePreviewFrameNumber = frame.Sequence;
+        if (!wasInteractiveReady && frame.ReceivedAtTimestamp >= _emulator.PreviewInteractionAfterTimestamp)
+            OnPropertyChanged(nameof(CanOperateEmulator));
     }
 
     /// <summary>Records a distinct frame submitted by the preview control's DrawImage call.</summary>
     public void ReportPreviewRendered(long sequence, long renderedAtTimestamp)
     {
-        if (_previewDisposed || IsSelectingTemplate || sequence <= 0) return;
+        if (_previewDisposed || IsSelectingTemplate || _emulator.Diagnostics.IsPreviewPaused || sequence <= 0) return;
         lock (_previewMetricsLock)
         {
             if (sequence == _lastRenderedSequence) return;
@@ -146,8 +153,12 @@ public partial class MainViewModel
             _loggedRenderedFrames = renderedFrames;
             ResetProcessMetricsBaseline();
         }
+        else if (_emulator.Diagnostics.IsScreenshotStreamPaused)
+            LivePreviewStatus = "性能诊断：截图流已暂停，游戏继续运行；自动识别暂停";
         else if (!_emulator.HasLiveScreenshotStream)
             LivePreviewStatus = "模拟器截图流中断，请重启模拟器";
+        else if (_emulator.Diagnostics.IsPreviewPaused)
+            LivePreviewStatus = $"性能诊断：预览已暂停；截图接收 {receiveFps:F1} 帧/秒，自动识别可继续";
         else if (LivePreviewImage is { } image)
         {
             var waiting = receivedInPeriod == 0 && ageMs >= 1000 ? "等待新画面 · " : string.Empty;
@@ -155,38 +166,48 @@ public partial class MainViewModel
                 ? $"{received.ReceiveIntervalP95Ms:F1}/{drawn.ReceiveIntervalP95Ms:F1} ms" : "暂无样本";
             LivePreviewStatus = $"{waiting}接收 {receiveFps:F1} / 绘制提交 {drawFps:F1} 帧/秒 · {image.PixelSize.Width} × {image.PixelSize.Height}"
                 + $" · 近5s间隔P95 {intervals} · 距新帧 {ageMs:F0} ms";
-            if (!IsSelectingTemplate && Stopwatch.GetElapsedTime(_lastPerformanceLogTimestamp, now).TotalSeconds >= 5)
-            {
-                var logSeconds = Stopwatch.GetElapsedTime(_lastPerformanceLogTimestamp, now).TotalSeconds;
-                var receivedCount = received.ReceivedFrames >= _loggedReceivedFrames ? received.ReceivedFrames - _loggedReceivedFrames : received.ReceivedFrames;
-                var loggedReceiveFps = receivedCount / logSeconds;
-                var loggedDrawFps = (renderedFrames - _loggedRenderedFrames) / logSeconds;
-                var stages = _emulator.PreviewStatistics.GetSnapshot(now);
-                var allocatedBytes = GC.GetTotalAllocatedBytes(precise: false);
-                var gcPause = GC.GetTotalPauseDuration();
-                var gen2Collections = GC.CollectionCount(2);
-                var touch = _previewTouches.GetSnapshot();
-                var sourceDelivery = received.SourceTimestampSamples > 0
-                    ? $"{received.EstimatedGenerationToReceiveP95Ms:F1} ms/{received.SourceTimestampSamples}样本"
-                    : "暂无有效源时间戳样本";
-                AddLog($"预览性能（近 {logSeconds:F1}s）：接收 {loggedReceiveFps:F1} / 绘制提交 {loggedDrawFps:F1} 帧/秒；{image.PixelSize.Width} × {image.PixelSize.Height}；"
-                    + $"近5s接收/绘制间隔 P95 {intervals}（样本 {received.WindowIntervalSamples}/{drawn.WindowIntervalSamples}）；距上次收帧 {ageMs:F0} ms；源序号缺口累计 {received.SourceSkippedFrames}。"
-                    + $" 模拟器估计图像生成至收到完整帧P95 {sourceDelivery}（近5s，非游戏源帧时间）。"
-                    + $" 收帧后耗时P95：转换 {FormatTiming(stages.Conversion)}，收帧至预览就绪 {FormatTiming(stages.ReceiveToPreview)}，UI等待 {FormatTiming(stages.PreviewToUi)}，位图复制 {FormatTiming(stages.UiCopy)}，收帧至绘制提交 {FormatTiming(stages.ReceiveToDraw)}（近5s，不含模拟器渲染/截图和显示器呈现）。"
-                    + $" 进程分配 {Math.Max(0, allocatedBytes - _loggedAllocatedBytes) / logSeconds / 1_000_000d:F1} MB/s，GC暂停 {Math.Max(0, (gcPause - _loggedGcPause).TotalMilliseconds):F1} ms，Gen2 {Math.Max(0, gen2Collections - _loggedGen2Collections)} 次。"
-                    + $" 触控RPC P95 {touch.RpcP95Ms:F1} ms（最近120次），待处理手势 {touch.PendingGestures}，累计合并移动 {touch.CoalescedMoves}，丢弃过期/超额手势 {touch.DiscardedGestures}。"
-                    + $" 会话最大新帧间隔 {received.MaxReceiveIntervalMs:F1}/{drawn.MaxReceiveIntervalMs:F1} ms；超过50ms次数 {received.LongReceiveIntervals}/{drawn.LongReceiveIntervals}；以上新帧速率与间隔含静止时间，不是游戏FPS。"
-                    + (waiting.Length > 0 ? " 等待新画面，静止时无新帧不代表卡顿。" : string.Empty));
-                _loggedAllocatedBytes = allocatedBytes;
-                _loggedGcPause = gcPause;
-                _loggedGen2Collections = gen2Collections;
-                _loggedReceivedFrames = received.ReceivedFrames;
-                _loggedRenderedFrames = renderedFrames;
-                _lastPerformanceLogTimestamp = now;
-            }
         }
         else
             LivePreviewStatus = "正在等待模拟器首帧…";
+
+        // Diagnostics must still report CPU/memory while preview or streaming is
+        // paused. Their absence used to make readback comparisons impossible.
+        if (IsEmulatorRunning && !IsSelectingTemplate && Stopwatch.GetElapsedTime(_lastPerformanceLogTimestamp, now).TotalSeconds >= 5)
+        {
+            var logSeconds = Stopwatch.GetElapsedTime(_lastPerformanceLogTimestamp, now).TotalSeconds;
+            var receivedCount = received.ReceivedFrames >= _loggedReceivedFrames ? received.ReceivedFrames - _loggedReceivedFrames : received.ReceivedFrames;
+            var loggedReceiveFps = receivedCount / logSeconds;
+            var loggedDrawFps = (renderedFrames - _loggedRenderedFrames) / logSeconds;
+            var stages = _emulator.PreviewStatistics.GetSnapshot(now);
+            var allocatedBytes = GC.GetTotalAllocatedBytes(precise: false);
+            var gcPause = GC.GetTotalPauseDuration();
+            var gen2Collections = GC.CollectionCount(2);
+            var touch = _previewTouches.GetSnapshot();
+            var touchRpc = _emulator.TouchStatistics.GetSnapshot(now);
+            var sourceDelivery = received.SourceTimestampSamples > 0
+                ? $"{received.EstimatedGenerationToReceiveP95Ms:F1} ms/{received.SourceTimestampSamples}样本"
+                : "暂无有效源时间戳样本";
+            var intervals = received.WindowIntervalSamples > 0 && drawn.WindowIntervalSamples > 0
+                ? $"{received.ReceiveIntervalP95Ms:F1}/{drawn.ReceiveIntervalP95Ms:F1} ms" : "暂无样本";
+            var resources = _resources?.Latest;
+            var recognition = _recognitionStatistics.GetSnapshot();
+            AddLog($"预览性能（近 {logSeconds:F1}s；{PerformanceDiagnostics.Describe(_emulator.Diagnostics.Mode)}）：接收 {loggedReceiveFps:F1} / 绘制提交 {loggedDrawFps:F1} 帧/秒；{ScreenSizeText}；"
+                + $"近5s接收/绘制间隔 P95 {intervals}（样本 {received.WindowIntervalSamples}/{drawn.WindowIntervalSamples}）；距上次收帧 {ageMs:F0} ms；源序号缺口累计 {received.SourceSkippedFrames}。"
+                + $" 模拟器估计图像生成至收到完整帧P95 {sourceDelivery}（近5s，非游戏源帧时间）。"
+                + $" 收帧后耗时P95：转换 {FormatTiming(stages.Conversion)}，收帧至预览就绪 {FormatTiming(stages.ReceiveToPreview)}，UI等待 {FormatTiming(stages.PreviewToUi)}，位图复制 {FormatTiming(stages.UiCopy)}，收帧至绘制提交 {FormatTiming(stages.ReceiveToDraw)}（近5s，不含模拟器渲染/截图和显示器呈现）。"
+                + $" 进程分配 {Math.Max(0, allocatedBytes - _loggedAllocatedBytes) / logSeconds / 1_000_000d:F1} MB/s，GC暂停 {Math.Max(0, (gcPause - _loggedGcPause).TotalMilliseconds):F1} ms，Gen2 {Math.Max(0, gen2Collections - _loggedGen2Collections)} 次。"
+                + $" 全部触控RPC {FormatTiming(touchRpc.Recent)}（近5s）；会话请求/失败或取消 {touchRpc.Calls}/{touchRpc.FailedCalls}。手动触控RPC P95 {touch.RpcP95Ms:F1} ms（最近120次），待处理手势 {touch.PendingGestures}，累计合并移动 {touch.CoalescedMoves}，丢弃过期/超额手势 {touch.DiscardedGestures}。"
+                + $" FgoAuto：{(resources is null ? "待采样" : FormatResource(resources.Client))}；模拟器：{(resources is null ? "待采样" : FormatResource(resources.Emulator))}。"
+                + $" 识别耗时统计：{recognition}。"
+                + $" 会话最大新帧间隔 {received.MaxReceiveIntervalMs:F1}/{drawn.MaxReceiveIntervalMs:F1} ms；超过50ms次数 {received.LongReceiveIntervals}/{drawn.LongReceiveIntervals}；以上新帧速率与间隔含静止时间，不是游戏FPS。"
+                + (receivedInPeriod == 0 ? " 无新帧（静止或诊断暂停），不据此判断游戏卡顿。" : string.Empty));
+            _loggedAllocatedBytes = allocatedBytes;
+            _loggedGcPause = gcPause;
+            _loggedGen2Collections = gen2Collections;
+            _loggedReceivedFrames = received.ReceivedFrames;
+            _loggedRenderedFrames = renderedFrames;
+            _lastPerformanceLogTimestamp = now;
+        }
         _previousReceivedFrames = received.ReceivedFrames;
         _previousRenderedFrames = renderedFrames;
         _previewFpsClock.Restart();
@@ -198,6 +219,18 @@ public partial class MainViewModel
         _drawStatistics.ResetIntervals();
         if (!value)
             RenderLatestEmulatorFrame();
+    }
+
+    private void ResetPreviewMeasurementWindow()
+    {
+        _emulator.FrameStatistics.ResetIntervals();
+        _emulator.PreviewStatistics.Reset();
+        _drawStatistics.ResetIntervals();
+        _previousReceivedFrames = _loggedReceivedFrames = _emulator.FrameStatistics.GetSnapshot().ReceivedFrames;
+        _previousRenderedFrames = _loggedRenderedFrames = _drawStatistics.GetSnapshot().ReceivedFrames;
+        _lastPerformanceLogTimestamp = Stopwatch.GetTimestamp();
+        _previewFpsClock.Restart();
+        ResetProcessMetricsBaseline();
     }
 
     private void ClearVideoBitmap()
@@ -229,6 +262,7 @@ public partial class MainViewModel
     {
         if (_previewDisposed) return;
         _previewDisposed = true;
+        _resources?.Dispose();
         _previewTimer?.Stop();
         if (_previewTimer is not null) _previewTimer.Tick -= OnPreviewTick;
         ClearVideoBitmap();

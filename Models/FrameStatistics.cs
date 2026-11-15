@@ -43,9 +43,14 @@ public sealed class FrameStatistics
                 // frame after a long gap must not hide that gap.
                 _intervals.Record(interval, receivedAt);
             }
-            if (_lastSequence >= 0 && sourceSequence > _lastSequence + 1)
-                _skipped += sourceSequence - _lastSequence - 1;
-            _lastSequence = sourceSequence;
+            // Unary confirmation frames have no streaming sequence. They must
+            // not reset the server's sequence or manufacture a later gap.
+            if (sourceSequence >= 0)
+            {
+                if (_lastSequence >= 0 && sourceSequence > _lastSequence + 1)
+                    _skipped += sourceSequence - _lastSequence - 1;
+                _lastSequence = sourceSequence;
+            }
             _lastAt = receivedAt;
             _received++;
         }

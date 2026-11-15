@@ -17,7 +17,8 @@ namespace FgoAuto.Services;
 internal sealed class EmulatorGrpcClient : IDisposable
 {
     private const string ServiceName = "android.emulation.control.EmulatorController";
-    private static readonly Marshaller<byte[]> BytesMarshaller = Marshallers.Create<byte[]>(bytes => bytes, bytes => bytes);
+    private static readonly Marshaller<byte[]> BytesMarshaller = Marshallers.Create<byte[]>(
+        static (bytes, context) => context.Complete(bytes), DeserializeBytes);
     private static readonly Method<byte[], byte[]> ScreenshotMethod = new(
         MethodType.ServerStreaming, ServiceName, "streamScreenshot", BytesMarshaller, BytesMarshaller);
     private static readonly Method<byte[], byte[]> GetScreenshotMethod = new(
@@ -175,6 +176,23 @@ internal sealed class EmulatorGrpcClient : IDisposable
 
     private Metadata CreateHeaders() => new() { { "authorization", $"Bearer {_token}" } };
 
+    private static byte[] DeserializeBytes(DeserializationContext context)
+    {
+        var payload = context.PayloadAsReadOnlySequence();
+        var length = context.PayloadLength;
+        if (length < 0 || payload.Length != length)
+            throw new InvalidDataException("gRPC 消息长度与数据不一致。");
+        if (length == 0) return [];
+
+        // Grpc.Net.Client's default PayloadAsNewBuffer uses sequence.ToArray(),
+        // which zero-initializes this multi-megabyte array before copying it.
+        // Every byte below is immediately overwritten. Keep a fresh owned array:
+        // publishing or retaining gRPC's pooled receive storage would tear frames.
+        var bytes = GC.AllocateUninitializedArray<byte>(length);
+        payload.CopyTo(bytes);
+        return bytes;
+    }
+
     private byte[] SerializeRgb888Request()
     {
         using var request = new MemoryStream(16);
@@ -200,7 +218,8 @@ internal sealed class EmulatorGrpcClient : IDisposable
     private GameFrame? DecodeImage(byte[] message, long receivedAt, out long sourceSequence)
     {
         ReadOnlyMemory<byte> pixels = default;
-        byte[]? format = null;
+        ReadOnlyMemory<byte> format = default;
+        var hasFormat = false;
         uint sequence = 0;
         ulong timestampUs = 0;
         for (var offset = 0; offset < message.Length;)
@@ -214,7 +233,7 @@ internal sealed class EmulatorGrpcClient : IDisposable
                 if (length < 0 || length > message.Length - offset) throw new InvalidDataException("gRPC 画面消息长度无效。");
                 var payload = message.AsMemory(offset, length);
                 offset += length;
-                if (field == 1) format = payload.ToArray();
+                if (field == 1) { format = payload; hasFormat = true; }
                 else if (field == 4) pixels = payload;
             }
             else if (wire == 0)
@@ -228,9 +247,9 @@ internal sealed class EmulatorGrpcClient : IDisposable
         }
 
         sourceSequence = sequence;
-        if (pixels.Length == 0 || format is null)
+        if (pixels.Length == 0 || !hasFormat)
             return null;
-        var (width, height, pixelFormat) = DecodeImageFormat(format);
+        var (width, height, pixelFormat) = DecodeImageFormat(format.Span);
         if (pixelFormat != 2 || width <= 0 || height <= 0 || (long)width * height * 3 != pixels.Length || pixels.Length > _maxFrameBytes)
             throw new InvalidDataException($"模拟器返回了不支持的画面数据（{width} × {height}，{pixelFormat}，{pixels.Length} 字节）。");
 
@@ -255,7 +274,7 @@ internal sealed class EmulatorGrpcClient : IDisposable
             nativeWidth, nativeHeight, receivedAt, hasSourceTimestamp);
     }
 
-    private static (int Width, int Height, int Format) DecodeImageFormat(byte[] bytes)
+    private static (int Width, int Height, int Format) DecodeImageFormat(ReadOnlySpan<byte> bytes)
     {
         var width = 0;
         var height = 0;
@@ -278,16 +297,16 @@ internal sealed class EmulatorGrpcClient : IDisposable
         return (width, height, format);
     }
 
-    private static ReadOnlySpan<byte> ReadLengthDelimited(byte[] bytes, ref int offset)
+    private static ReadOnlySpan<byte> ReadLengthDelimited(ReadOnlySpan<byte> bytes, ref int offset)
     {
         var length = checked((int)ReadVarint(bytes, ref offset));
-        if (length < 0 || offset + length > bytes.Length) throw new InvalidDataException("gRPC 画面消息长度无效。");
-        var result = bytes.AsSpan(offset, length);
+        if (length < 0 || length > bytes.Length - offset) throw new InvalidDataException("gRPC 画面消息长度无效。");
+        var result = bytes.Slice(offset, length);
         offset += length;
         return result;
     }
 
-    private static ulong ReadVarint(byte[] bytes, ref int offset)
+    private static ulong ReadVarint(ReadOnlySpan<byte> bytes, ref int offset)
     {
         ulong value = 0;
         for (var shift = 0; shift < 64; shift += 7)
@@ -300,7 +319,7 @@ internal sealed class EmulatorGrpcClient : IDisposable
         throw new InvalidDataException("gRPC Varint 超长。");
     }
 
-    private static void SkipField(byte[] bytes, ref int offset, int wire)
+    private static void SkipField(ReadOnlySpan<byte> bytes, ref int offset, int wire)
     {
         switch (wire)
         {

@@ -29,10 +29,13 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
     private readonly CancellationTokenSource _lifetimeCancellation = new();
     private readonly object _outputLock = new();
     private Process? _emulatorProcess;
+    private int _runtimeProcessId;
     private EmulatorGrpcClient? _grpc;
     private CancellationTokenSource? _streamCancellation;
     private Task? _streamTask;
     private Task? _previewTask;
+    private Task? _streamObserverTask;
+    private long _previewInteractionAfter;
     private readonly SemaphoreSlim _previewSignal = new(0, 1);
     private VideoPreviewFrame? _pendingPreview;
     private GameFrame? _latestFrame;
@@ -78,12 +81,66 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
     public bool UseOpenGlMode { get; private set; }
     public FrameStatistics FrameStatistics { get; } = new();
     public PreviewPipelineStatistics PreviewStatistics { get; } = new();
+    public PerformanceDiagnostics Diagnostics { get; } = new();
+    public RpcStatistics TouchStatistics { get; } = new();
+    public int RuntimeProcessId => Volatile.Read(ref _runtimeProcessId);
+    public long PreviewInteractionAfterTimestamp => Interlocked.Read(ref _previewInteractionAfter);
     public bool IsPrepared => File.Exists(Path.Combine(_sdkRoot, "emulator", "emulator.exe"))
         && File.Exists(Path.Combine(_sdkRoot, "platform-tools", "adb.exe"))
         && File.Exists(Path.Combine(_sdkRoot, "system-images", "android-34", "google_apis_playstore", "x86_64", "system.img"))
         && File.Exists(Path.Combine(_avdDirectory, "config.ini"));
 
-    public VideoPreviewFrame? TakeLatestPreviewFrame() => Interlocked.Exchange(ref _pendingPreview, null);
+    public VideoPreviewFrame? TakeLatestPreviewFrame()
+    {
+        var preview = Interlocked.Exchange(ref _pendingPreview, null);
+        // If UI backpressure suppressed conversions, consume the final latest frame
+        // even when the Android display has since become static.
+        if (preview is not null && Volatile.Read(ref _latestFrame) is { } latest && latest.FrameId != preview.Sequence)
+            SignalPreview();
+        return preview;
+    }
+
+    public async Task SetDiagnosticModeAsync(PerformanceDiagnosticMode mode, CancellationToken cancellationToken = default)
+    {
+        if (!Enum.IsDefined(mode)) throw new ArgumentOutOfRangeException(nameof(mode));
+        await _lifecycle.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+            var wasPreviewPaused = Diagnostics.IsPreviewPaused;
+            Diagnostics.SetMode(mode);
+            if (wasPreviewPaused || Diagnostics.IsPreviewPaused)
+                Interlocked.Exchange(ref _previewInteractionAfter, Stopwatch.GetTimestamp());
+            Interlocked.Exchange(ref _pendingPreview, null)?.Dispose();
+            if (Diagnostics.IsScreenshotStreamPaused)
+            {
+                await StopScreenshotStreamAsync().ConfigureAwait(false);
+                if (IsRunning) SetStatus("性能诊断：截图流已暂停，模拟器继续运行；自动识别暂时暂停。");
+            }
+            else if (IsRunning)
+            {
+                if (!HasLiveScreenshotStream)
+                {
+                    await StopScreenshotStreamAsync().ConfigureAwait(false);
+                    StartScreenshotStream();
+                }
+                if (wasPreviewPaused && !Diagnostics.IsPreviewPaused
+                    && (Volatile.Read(ref _latestFrame) is not { } latest
+                        || latest.ReceivedAtTimestamp < PreviewInteractionAfterTimestamp))
+                {
+                    // A static display may not emit another streaming frame.
+                    // Confirm it once on resume rather than re-enabling input on
+                    // the frozen bitmap, or leaving input disabled indefinitely.
+                    var fresh = await _grpc!.CaptureFrameAsync(cancellationToken).ConfigureAwait(false);
+                    ReceiveFrame(fresh, -1);
+                }
+                SignalPreview();
+                SetStatus($"性能诊断：{PerformanceDiagnostics.Describe(mode)}。");
+            }
+            else LogReceived?.Invoke($"性能诊断：{PerformanceDiagnostics.Describe(mode)}（启动后生效）。");
+        }
+        finally { _lifecycle.Release(); }
+    }
 
     public void SetPerformanceMode(bool enabled)
     {
@@ -194,7 +251,7 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
             if (openGlMode) startArguments.AddRange(["-feature", "-Vulkan"]);
             LogReceived?.Invoke($"游戏运行配置：Android 实际渲染 {profile.Width} × {profile.Height} @ {profile.Density} dpi；主机 GPU；"
                 + $"{(openGlMode ? "OpenGL 游戏模式（关闭客体 Vulkan）" : "标准图形模式（保留 Vulkan）")}；"
-                + "关闭摄像头、GPS、麦克风；模板逻辑坐标仍为 1920 × 1080。" );
+                + "关闭摄像头、GPS、麦克风；模板逻辑坐标仍为 1920 × 1080。");
             var startInfo = CreateProcessStartInfo(emulatorExe, startArguments);
             _emulatorProcess = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
             _emulatorProcess.OutputDataReceived += (_, e) => { if (!string.IsNullOrWhiteSpace(e.Data)) AppendRuntimeOutput(e.Data); };
@@ -206,6 +263,7 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
             progress?.Report(Status);
 
             var credential = await WaitForGrpcCredentialsAsync(_emulatorProcess, cancellationToken).ConfigureAwait(false);
+            Volatile.Write(ref _runtimeProcessId, credential.Pid);
             _grpc = new EmulatorGrpcClient(credential.Port, credential.Token,
                 maxWidth: performanceMode ? 1280 : 0, maxHeight: performanceMode ? 1280 : 0,
                 deviceWidth: profile.Width, deviceHeight: profile.Height);
@@ -243,17 +301,16 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
             catch (Exception error) when (error is IOException or UnauthorizedAccessException)
             { LogReceived?.Invoke($"无法保存上次图形模式，下次启动可能重新冷启动：{error.Message}"); }
 
-            _streamCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            _firstFrame = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             FrameStatistics.Reset();
             PreviewStatistics.Reset();
-            var streamToken = _streamCancellation.Token;
-            var client = _grpc;
-            _previewTask = Task.Run(() => RunPreviewConversionAsync(streamToken), streamToken);
-            _streamTask = Task.Run(() => client.RunScreenshotStreamAsync(ReceiveFrame, streamToken), streamToken);
-            _ = ObserveScreenshotStreamAsync(_streamTask, _streamCancellation.Token);
-            await _firstFrame.Task.WaitAsync(TimeSpan.FromSeconds(30), cancellationToken).ConfigureAwait(false);
-            SetStatus("Android 模拟器已就绪；点击右侧预览可操作 Play 商店并安装 FGO。");
+            TouchStatistics.Reset();
+            if (!Diagnostics.IsScreenshotStreamPaused)
+            {
+                StartScreenshotStream();
+                await _firstFrame.Task.WaitAsync(TimeSpan.FromSeconds(30), cancellationToken).ConfigureAwait(false);
+            }
+            SetStatus(Diagnostics.IsScreenshotStreamPaused ? "Android 模拟器已就绪；性能诊断已暂停截图流。"
+                : "Android 模拟器已就绪；点击右侧预览可操作 Play 商店并安装 FGO。");
             progress?.Report(Status);
         }
         catch
@@ -273,11 +330,12 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
 
     public GameFrame? CaptureLatestFrame()
     {
-        return Volatile.Read(ref _latestFrame);
+        return Diagnostics.IsScreenshotStreamPaused ? null : Volatile.Read(ref _latestFrame);
     }
 
     public async Task<GameFrame> CaptureFreshFrameAsync(CancellationToken cancellationToken = default)
     {
+        if (Diagnostics.IsScreenshotStreamPaused) throw new InvalidOperationException("性能诊断已暂停截图流，恢复后才能复核画面。");
         var client = _grpc ?? throw new InvalidOperationException("Android 模拟器尚未启动。");
         var previous = Volatile.Read(ref _latestFrame);
         var deadline = Stopwatch.StartNew();
@@ -291,13 +349,21 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
         }
         // A static Android display may not publish a new streaming frame. A unary
         // capture then confirms that the screen is still current before touching it.
+        if (Diagnostics.IsScreenshotStreamPaused) throw new InvalidOperationException("性能诊断已暂停截图流，恢复后才能复核画面。");
         return await client.CaptureFrameAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    public Task SendTouchAsync(int x, int y, int pressure, int identifier = 1, CancellationToken cancellationToken = default)
+    public async Task SendTouchAsync(int x, int y, int pressure, int identifier = 1, CancellationToken cancellationToken = default)
     {
         var client = _grpc ?? throw new InvalidOperationException("Android 模拟器尚未启动。");
-        return client.SendTouchAsync(x, y, pressure, identifier, cancellationToken);
+        var startedAt = Stopwatch.GetTimestamp();
+        var success = false;
+        try
+        {
+            await client.SendTouchAsync(x, y, pressure, identifier, cancellationToken).ConfigureAwait(false);
+            success = true;
+        }
+        finally { TouchStatistics.Record(startedAt, Stopwatch.GetTimestamp(), success); }
     }
 
     private async Task InstallSdkPackageAsync(string package, IProgress<string>? progress, CancellationToken cancellationToken)
@@ -596,7 +662,7 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
         return info;
     }
 
-    private async Task<(int Port, string Token)> WaitForGrpcCredentialsAsync(Process process, CancellationToken cancellationToken)
+    private async Task<(int Port, string Token, int Pid)> WaitForGrpcCredentialsAsync(Process process, CancellationToken cancellationToken)
     {
         var directories = new[]
         {
@@ -646,7 +712,7 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
                         || !Path.GetFullPath(avdDirectory).Equals(Path.GetFullPath(_avdDirectory), StringComparison.OrdinalIgnoreCase)) continue;
                     if (int.TryParse(values.GetValueOrDefault("grpc.port"), out var port)
                         && values.TryGetValue("grpc.token", out var token) && !string.IsNullOrWhiteSpace(token))
-                        return (port, token);
+                        return (port, token, emulatorPid);
                 }
             }
             await Task.Delay(250, cancellationToken).ConfigureAwait(false);
@@ -674,54 +740,124 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
         Volatile.Write(ref _latestFrame, frame);
         FrameStatistics.Record(sourceSequence, frame.ReceivedAtTimestamp,
             frame.HasSourceTimestamp ? frame.CapturedAtTimestamp : 0);
+        _firstFrame.TrySetResult();
+        SignalPreview();
+    }
+
+    private void SignalPreview()
+    {
+        if (_disposed || _previewSignal.CurrentCount != 0) return;
         try { _previewSignal.Release(); }
         catch (SemaphoreFullException) { } // Only a single latest-frame notification is needed.
     }
 
-    private async Task RunPreviewConversionAsync(CancellationToken cancellationToken)
+    private void StartScreenshotStream()
     {
+        var client = _grpc ?? throw new InvalidOperationException("Android 模拟器尚未启动。");
+        _streamCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellation.Token);
+        var session = _streamCancellation;
+        _firstFrame = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstFrame = _firstFrame;
+        Interlocked.Exchange(ref _previewInteractionAfter, Stopwatch.GetTimestamp());
+        var streamToken = _streamCancellation.Token;
+        _previewTask = Task.Run(() => RunPreviewConversionAsync(session, firstFrame), streamToken);
+        _streamTask = Task.Run(() => client.RunScreenshotStreamAsync((frame, sequence) =>
+        {
+            if (!streamToken.IsCancellationRequested) ReceiveFrame(frame, sequence);
+        }, streamToken), streamToken);
+        _streamObserverTask = ObserveScreenshotStreamAsync(_streamTask, session, firstFrame);
+    }
+
+    private async Task StopScreenshotStreamAsync()
+    {
+        _streamCancellation?.Cancel();
+        foreach (var task in new[] { _streamTask, _previewTask, _streamObserverTask })
+        {
+            if (task is null) continue;
+            try { await task.ConfigureAwait(false); }
+            // The observer reports faults. A corrupt/failed stream must never
+            // prevent disposal or shutting down the owned guest process.
+            catch (Exception) { }
+        }
+        _streamTask = _previewTask = _streamObserverTask = null;
+        _streamCancellation?.Dispose();
+        _streamCancellation = null;
+        Interlocked.Exchange(ref _pendingPreview, null)?.Dispose();
+        Volatile.Write(ref _latestFrame, null);
+        while (_previewSignal.Wait(0)) { }
+        // Do not mix a deliberate diagnostic pause into frame-pacing percentiles.
+        FrameStatistics.ResetIntervals();
+        PreviewStatistics.Reset();
+    }
+
+    private async Task RunPreviewConversionAsync(CancellationTokenSource session, TaskCompletionSource firstFrame)
+    {
+        var cancellationToken = session.Token;
         long lastConverted = -1;
+        var scheduler = new PreviewWorkScheduler();
         try
         {
             while (true)
             {
                 await _previewSignal.WaitAsync(cancellationToken).ConfigureAwait(false);
+                if (Diagnostics.IsPreviewPaused) { scheduler.Reset(); continue; }
+                // Normal mode must not sleep before displaying an arrived frame:
+                // a sub-millisecond Task.Delay can cost a Windows timer tick.
+                // Only the explicit diagnostic cap trades latency for less work.
+                if (Diagnostics.Mode == PerformanceDiagnosticMode.Preview30Fps)
+                {
+                    var delay = scheduler.GetDelay(Stopwatch.GetTimestamp(), 30);
+                    if (delay > TimeSpan.Zero) await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+                }
+                else scheduler.Reset();
+                if (Diagnostics.IsPreviewPaused) continue;
+                // Avoid converting a frame which cannot be consumed yet. The UI
+                // signals us after taking the pending buffer; no old frame queue.
+                if (Volatile.Read(ref _pendingPreview) is not null) continue;
                 var frame = Volatile.Read(ref _latestFrame);
                 if (frame is null || frame.FrameId == lastConverted) continue;
                 var conversionStartedAt = Stopwatch.GetTimestamp();
+                scheduler.RecordStarted(conversionStartedAt);
                 var preview = EmulatorGrpcClient.ToPreviewFrame(frame);
                 PreviewStatistics.RecordConversion(frame, conversionStartedAt, preview.PreviewReadyAtTimestamp);
                 lastConverted = frame.FrameId;
+                if (Diagnostics.IsPreviewPaused || cancellationToken.IsCancellationRequested)
+                { preview.Dispose(); continue; }
                 Interlocked.Exchange(ref _pendingPreview, preview)?.Dispose();
-                _firstFrame.TrySetResult();
+                firstFrame.TrySetResult();
                 FrameAvailable?.Invoke();
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
         catch (Exception error)
         {
-            _firstFrame.TrySetException(error);
-            _streamCancellation?.Cancel();
+            firstFrame.TrySetException(error);
+            session.Cancel();
             Interlocked.Exchange(ref _pendingPreview, null)?.Dispose();
             SetStatus($"模拟器截图流预览转换失败：{error.Message}。请重启模拟器。");
         }
     }
 
-    private async Task ObserveScreenshotStreamAsync(Task streamTask, CancellationToken cancellationToken)
+    private async Task ObserveScreenshotStreamAsync(Task streamTask, CancellationTokenSource session, TaskCompletionSource firstFrame)
     {
+        var cancellationToken = session.Token;
         try
         {
             await streamTask.ConfigureAwait(false);
             if (!cancellationToken.IsCancellationRequested)
+            {
+                session.Cancel();
+                firstFrame.TrySetException(new InvalidOperationException("模拟器截图流在首帧前结束。"));
                 SetStatus("模拟器截图流意外结束。请重启模拟器以恢复预览和自动识别。");
+            }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { }
         catch (Exception exception)
         {
             if (!cancellationToken.IsCancellationRequested)
             {
-                _firstFrame.TrySetException(new InvalidOperationException("模拟器截图流在首帧前中断。", exception));
-                _streamCancellation?.Cancel();
+                firstFrame.TrySetException(new InvalidOperationException("模拟器截图流在首帧前中断。", exception));
+                session.Cancel();
                 SetStatus($"模拟器截图流中断：{_grpc?.SanitizeError(exception) ?? exception.GetType().Name}。请重启模拟器恢复。");
             }
         }
@@ -729,11 +865,13 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
 
     private async Task StopCoreAsync()
     {
+        await StopScreenshotStreamAsync().ConfigureAwait(false);
         var process = _emulatorProcess;
         if (process is null)
         {
             _grpc?.Dispose();
             _grpc = null;
+            Volatile.Write(ref _runtimeProcessId, 0);
             return;
         }
 
@@ -754,24 +892,10 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
             try { await process.WaitForExitAsync().WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false); } catch { }
         }
 
-        _streamCancellation?.Cancel();
-        if (_streamTask is not null)
-        {
-            try { await _streamTask.WaitAsync(TimeSpan.FromSeconds(3)).ConfigureAwait(false); }
-            catch (Exception) { }
-        }
-        if (_previewTask is not null)
-        {
-            try { await _previewTask.ConfigureAwait(false); }
-            catch (OperationCanceledException) { }
-        }
-        _previewTask = null;
-        _streamCancellation?.Dispose();
-        _streamCancellation = null;
-        _streamTask = null;
         _grpc?.Dispose();
         _grpc = null;
         _emulatorProcess = null;
+        Volatile.Write(ref _runtimeProcessId, 0);
         process.Dispose();
         Interlocked.Exchange(ref _pendingPreview, null)?.Dispose();
         Volatile.Write(ref _latestFrame, null);

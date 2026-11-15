@@ -131,7 +131,9 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     public string AutomationStateText => IsRunning ? $"执行“{SelectedRuleSet?.Name}” · {RunStageText}" : "尚未开始识别 · 点击“开始执行”运行套装";
     public string StartRunButtonText => IsRunning ? "识别执行中…" : "开始执行";
     public string PrepareEmulatorButtonText => IsPreparingEmulator ? "正在准备…" : "准备模拟器";
-    public bool CanOperateEmulator => IsEmulatorRunning && _emulator.HasLiveScreenshotStream && !IsRunning && !IsSelectingTemplate;
+    public bool CanOperateEmulator => IsEmulatorRunning && _emulator.HasLiveScreenshotStream && !IsRunning && !IsSelectingTemplate
+        && !_emulator.Diagnostics.IsPreviewPaused && !IsApplyingPerformanceDiagnostic
+        && _uploadedFrameReceivedAt > 0 && _uploadedFrameReceivedAt >= _emulator.PreviewInteractionAfterTimestamp;
     public bool CanPrepareEmulator => AreRuntimeLicensesAccepted && !IsPreparingEmulator && !IsEmulatorRunning;
     public string RunLogPath => _runLog.FilePath;
 
@@ -141,7 +143,8 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     public string RulesPath => _rulesPath;
 
     public MainViewModel() : this(Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FgoAuto")) { }
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "FgoAuto"))
+    { }
 
     public MainViewModel(string localDirectory)
     {
@@ -752,229 +755,262 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         var commandCards = new CommandCardSession();
         long lastProcessedFrame = -1;
         long lastScanStartedAt = 0;
+        var queries = new ImageMatchQuery[rules.Length];
         while (true)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            if (lastScanStartedAt > 0)
+            if (_emulator.Diagnostics.IsRecognitionPaused)
             {
-                var remaining = TimeSpan.FromMilliseconds(50) - Stopwatch.GetElapsedTime(lastScanStartedAt);
-                if (remaining > TimeSpan.Zero) await Task.Delay(remaining, cancellationToken);
+                RunStageText = "性能诊断暂停识别";
+                await Task.Delay(50, cancellationToken);
+                continue;
             }
-            lastScanStartedAt = Stopwatch.GetTimestamp();
-            if (!_emulator.IsRunning || !_emulator.HasLiveScreenshotStream)
-                throw new InvalidOperationException("Android 模拟器截图流已经中断；自动执行已停止，请重启模拟器恢复。");
-            var cycleTimer = Stopwatch.StartNew();
-            if (rules.Length == 0)
-                throw new OperationCanceledException(cancellationToken);
+            var recognitionEpoch = _emulator.Diagnostics.RecognitionEpoch;
+            try
+            {
+                if (lastScanStartedAt > 0)
+                {
+                    var remaining = TimeSpan.FromMilliseconds(50) - Stopwatch.GetElapsedTime(lastScanStartedAt);
+                    if (remaining > TimeSpan.Zero) await Task.Delay(remaining, cancellationToken);
+                }
+                lastScanStartedAt = Stopwatch.GetTimestamp();
+                if (_emulator.Diagnostics.IsRecognitionPaused) continue;
+                if (!_emulator.IsRunning || !_emulator.HasLiveScreenshotStream)
+                    throw new InvalidOperationException("Android 模拟器截图流已经中断；自动执行已停止，请重启模拟器恢复。");
+                var cycleTimer = Stopwatch.StartNew();
+                if (rules.Length == 0)
+                    throw new OperationCanceledException(cancellationToken);
 
-            var captureTimer = Stopwatch.StartNew();
-            RunStageText = "读取画面";
-            var frame = _emulator.CaptureLatestFrame();
-            if (frame is not null && frame.Age > TimeSpan.FromMilliseconds(250))
-                frame = await _emulator.CaptureFreshFrameAsync(cancellationToken);
-            if (frame is null)
-            {
-                await Task.Delay(40, cancellationToken);
-                continue;
-            }
-            if (frame.FrameId == lastProcessedFrame)
-            {
-                await Task.Delay(12, cancellationToken);
-                continue;
-            }
-            lastProcessedFrame = frame.FrameId;
-            captureTimer.Stop();
-            var queries = rules
-                .Select(rule => new ImageMatchQuery(rule.Target.Id, rule.Target.ImagePath, rule.Threshold, rule.IsCardRule, rule.PreferTopmostMatch, rule.IsNoblePhantasm))
-                .ToArray();
-            var matchTimer = Stopwatch.StartNew();
-            RunStageText = $"识别 {rules.Length} 条规则";
-            var (evaluations, frameWidth, frameHeight) = await Task.Run(() =>
-            {
-                var matches = _imageMatcher.FindAll(frame, queries, out var width, out var height);
-                return (matches, width, height);
-            }, cancellationToken);
-            matchTimer.Stop();
-            ScreenSizeText = $"{frameWidth} × {frameHeight}";
-            if (frame.Age > TimeSpan.FromMilliseconds(900))
-            {
-                StatusText = "本次识别画面已过期，已放弃旧坐标并重新截图。";
-                ReportRunObservation(StatusText);
-                continue;
-            }
-            var evaluationById = evaluations.ToDictionary(result => result.Id, StringComparer.OrdinalIgnoreCase);
-            // Keep ordinary-button visibility up to date even when this frame is handled by the card batch.
-            foreach (var rule in rules.Where(rule => !rule.IsCardRule))
-            {
-                if (!evaluationById.TryGetValue(rule.Target.Id, out var evaluation) || evaluation.IsAmbiguous || evaluation.Hit is null)
-                    rule.WasVisible = false;
-                if (evaluation is { IsAmbiguous: true })
+                var captureTimer = Stopwatch.StartNew();
+                RunStageText = "读取画面";
+                var frame = _emulator.CaptureLatestFrame();
+                if (frame is not null && frame.Age > TimeSpan.FromMilliseconds(250))
+                    frame = await _emulator.CaptureFreshFrameAsync(cancellationToken);
+                if (_emulator.Diagnostics.IsRecognitionPaused || recognitionEpoch != _emulator.Diagnostics.RecognitionEpoch)
+                    continue;
+                if (frame is null)
                 {
-                    if (ambiguityReported.Add(rule.Target.Id))
-                        AddLog($"“{rule.Target.Name}”命中多个相似位置（最高 {evaluation.BestScore:P1}），当前要求唯一，因此未点击；列表目标可启用“多处命中选最上方”。");
+                    await Task.Delay(40, cancellationToken);
+                    continue;
                 }
-                else
-                    ambiguityReported.Remove(rule.Target.Id);
-            }
-            var cardMatches = new List<(ImageClickRule Rule, ImageMatchHit Hit)>();
-            foreach (var rule in rules.Where(rule => rule.IsCardRule))
-            {
-                if (evaluationById.TryGetValue(rule.Target.Id, out var evaluation) && evaluation.MultipleHits is { } hits)
-                    cardMatches.AddRange(hits.Select(hit => (rule, hit)));
-            }
-            var cardPlan = commandCards.Plan(cardMatches, frameWidth, frameHeight, DateTime.UtcNow,
-                waitForNoblePhantasms: rules.Any(rule => rule.IsNoblePhantasm));
-            var visibleButtons = rules.Where(rule => !rule.IsCardRule)
-                .Where(rule => evaluationById.TryGetValue(rule.Target.Id, out var result) && result.Hit is not null)
-                .Select(rule => (Rule: rule, Hit: evaluationById[rule.Target.Id].Hit!)).ToArray();
-            // Skill icons and the Attack button fan can resemble card labels. Reliable button matches
-            // must remain actionable when a card hand has not been established.
-            var useOrdinaryButtons = visibleButtons.Any(button => button.Hit.Score >= 0.95)
-                || (commandCards.VisibleNormalCardCount < 5 && visibleButtons.Length > 0);
-            if (useOrdinaryButtons) cardPlan = [];
-            if (cardPlan.Count > 0)
-            {
-                RunStageText = "选择指令卡";
-                var clickFrame = frame;
-                var firstCard = true;
-                var skippedReason = string.Empty;
-                var result = await commandCards.ExecuteVerifiedAsync(cardPlan,
-                    async (candidate, token) =>
+                if (frame.FrameId == lastProcessedFrame)
+                {
+                    await Task.Delay(12, cancellationToken);
+                    continue;
+                }
+                lastProcessedFrame = frame.FrameId;
+                captureTimer.Stop();
+                for (var i = 0; i < rules.Length; i++)
+                {
+                    var rule = rules[i];
+                    var query = queries[i];
+                    if (query is null || query.Threshold != rule.Threshold || query.FindMultiple != rule.IsCardRule
+                        || query.PreferTopmostMatch != rule.PreferTopmostMatch || query.IsNoblePhantasm != rule.IsNoblePhantasm
+                        || query.Id != rule.Target.Id || query.ImagePath != rule.Target.ImagePath)
+                        queries[i] = new(rule.Target.Id, rule.Target.ImagePath, rule.Threshold, rule.IsCardRule, rule.PreferTopmostMatch, rule.IsNoblePhantasm);
+                }
+                var matchStartedAt = Stopwatch.GetTimestamp();
+                var matchTimer = Stopwatch.StartNew();
+                RunStageText = $"识别 {rules.Length} 条规则";
+                var (evaluations, frameWidth, frameHeight) = await Task.Run(() =>
+                {
+                    var matches = _imageMatcher.FindAll(frame, queries, out var width, out var height);
+                    return (matches, width, height);
+                }, cancellationToken);
+                matchTimer.Stop();
+                _recognitionStatistics.Record(matchStartedAt);
+                if (_emulator.Diagnostics.IsRecognitionPaused || recognitionEpoch != _emulator.Diagnostics.RecognitionEpoch)
+                    continue;
+                ScreenSizeText = $"{frameWidth} × {frameHeight}";
+                if (frame.Age > TimeSpan.FromMilliseconds(900))
+                {
+                    StatusText = "本次识别画面已过期，已放弃旧坐标并重新截图。";
+                    ReportRunObservation(StatusText);
+                    continue;
+                }
+                var evaluationById = evaluations.ToDictionary(result => result.Id, StringComparer.OrdinalIgnoreCase);
+                // Keep ordinary-button visibility up to date even when this frame is handled by the card batch.
+                foreach (var rule in rules.Where(rule => !rule.IsCardRule))
+                {
+                    if (!evaluationById.TryGetValue(rule.Target.Id, out var evaluation) || evaluation.IsAmbiguous || evaluation.Hit is null)
+                        rule.WasVisible = false;
+                    if (evaluation is { IsAmbiguous: true })
                     {
-                        if (firstCard) { firstCard = false; return candidate; }
-                        clickFrame = await _emulator.CaptureFreshFrameAsync(token);
-                        if (!await Task.Run(() => FrameGuard.IsSameScene(frame, clickFrame), token))
+                        if (ambiguityReported.Add(rule.Target.Id))
+                            AddLog($"“{rule.Target.Name}”命中多个相似位置（最高 {evaluation.BestScore:P1}），当前要求唯一，因此未点击；列表目标可启用“多处命中选最上方”。");
+                    }
+                    else
+                        ambiguityReported.Remove(rule.Target.Id);
+                }
+                var cardMatches = new List<(ImageClickRule Rule, ImageMatchHit Hit)>();
+                foreach (var rule in rules.Where(rule => rule.IsCardRule))
+                {
+                    if (evaluationById.TryGetValue(rule.Target.Id, out var evaluation) && evaluation.MultipleHits is { } hits)
+                        cardMatches.AddRange(hits.Select(hit => (rule, hit)));
+                }
+                var cardPlan = commandCards.Plan(cardMatches, frameWidth, frameHeight, DateTime.UtcNow,
+                    waitForNoblePhantasms: rules.Any(rule => rule.IsNoblePhantasm));
+                var visibleButtons = rules.Where(rule => !rule.IsCardRule)
+                    .Where(rule => evaluationById.TryGetValue(rule.Target.Id, out var result) && result.Hit is not null)
+                    .Select(rule => (Rule: rule, Hit: evaluationById[rule.Target.Id].Hit!)).ToArray();
+                // Skill icons and the Attack button fan can resemble card labels. Reliable button matches
+                // must remain actionable when a card hand has not been established.
+                var useOrdinaryButtons = visibleButtons.Any(button => button.Hit.Score >= 0.95)
+                    || (commandCards.VisibleNormalCardCount < 5 && visibleButtons.Length > 0);
+                if (useOrdinaryButtons) cardPlan = [];
+                if (cardPlan.Count > 0)
+                {
+                    RunStageText = "选择指令卡";
+                    var clickFrame = frame;
+                    var firstCard = true;
+                    var skippedReason = string.Empty;
+                    var result = await commandCards.ExecuteVerifiedAsync(cardPlan,
+                        async (candidate, token) =>
                         {
-                            skippedReason = "选卡画面已经切换";
-                            return null;
-                        }
-                        var hit = await Task.Run(() => _imageMatcher.FindNear(clickFrame,
-                            candidate.Rule.Target.ImagePath, candidate.Rule.Threshold, candidate.Hit), token);
-                        if (hit is null) skippedReason = "下一张卡已移动或消失";
-                        return hit is null ? null : candidate with { Hit = hit };
-                    },
-                    async (candidate, token) =>
+                            if (_emulator.Diagnostics.IsRecognitionPaused || recognitionEpoch != _emulator.Diagnostics.RecognitionEpoch)
+                                return null;
+                            if (firstCard) { firstCard = false; return candidate; }
+                            clickFrame = await _emulator.CaptureFreshFrameAsync(token);
+                            if (!await Task.Run(() => FrameGuard.IsSameScene(frame, clickFrame), token))
+                            {
+                                skippedReason = "选卡画面已经切换";
+                                return null;
+                            }
+                            var hit = await Task.Run(() => _imageMatcher.FindNear(clickFrame,
+                                candidate.Rule.Target.ImagePath, candidate.Rule.Threshold, candidate.Hit), token);
+                            if (hit is null) skippedReason = "下一张卡已移动或消失";
+                            return hit is null ? null : candidate with { Hit = hit };
+                        },
+                        async (candidate, token) =>
+                        {
+                            var click = await TryTapVerifiedAsync(clickFrame, candidate.Rule, candidate.Hit, token, recognitionEpoch);
+                            if (!click.Clicked) skippedReason = click.Reason;
+                            return click.Clicked;
+                        },
+                        candidate => AddLog($"选卡：已点击{candidate.PositionDescription}“{candidate.Rule.Target.Name}”，{candidate.Rule.TriggerCountDisplay}；坐标 ({candidate.Hit.CenterX}, {candidate.Hit.CenterY})。"),
+                        cancellationToken);
+                    if (result.LimitRule is { } limitRule)
                     {
-                        var click = await TryTapVerifiedAsync(clickFrame, candidate.Rule, candidate.Hit, token);
-                        if (!click.Clicked) skippedReason = click.Reason;
-                        return click.Clicked;
-                    },
-                    candidate => AddLog($"选卡：已点击{candidate.PositionDescription}“{candidate.Rule.Target.Name}”，{candidate.Rule.TriggerCountDisplay}；坐标 ({candidate.Hit.CenterX}, {candidate.Hit.CenterY})。"),
-                    cancellationToken);
-                if (result.LimitRule is { } limitRule)
-                {
-                    StopAtTriggerLimit(limitRule);
-                    return;
-                }
-                if (result.ScreenChanged)
-                {
-                    StatusText = $"已取消剩余选卡并重新识别：{skippedReason}。";
+                        StopAtTriggerLimit(limitRule);
+                        return;
+                    }
+                    if (result.ScreenChanged)
+                    {
+                        StatusText = $"已取消剩余选卡并重新识别：{skippedReason}。";
+                        AddLog(StatusText);
+                        continue;
+                    }
+                    cycleTimer.Stop();
+                    var nobleCount = cardPlan.Count(candidate => candidate.Rule.IsNoblePhantasm);
+                    StatusText = $"已选三张不同卡片（宝具 {nobleCount} 张、普通卡 {cardPlan.Count - nobleCount} 张），每张一次；等待进入战斗。本轮 {cycleTimer.Elapsed.TotalSeconds:F2}s。";
                     AddLog(StatusText);
                     continue;
                 }
-                cycleTimer.Stop();
-                var nobleCount = cardPlan.Count(candidate => candidate.Rule.IsNoblePhantasm);
-                StatusText = $"已选三张不同卡片（宝具 {nobleCount} 张、普通卡 {cardPlan.Count - nobleCount} 张），每张一次；等待进入战斗。本轮 {cycleTimer.Elapsed.TotalSeconds:F2}s。";
-                AddLog(StatusText);
-                continue;
-            }
-            string? incompleteCardStatus = null;
-            if (commandCards.VisibleCardCount > 0 && !useOrdinaryButtons)
-            {
-                StatusText = commandCards.IsComplete
-                    ? "本轮三张卡已选完，等待选卡界面结束，不重复点击。"
-                    : commandCards.WaitingForSettle
-                        ? $"已识别宝具 {commandCards.VisibleNoblePhantasmCount} 张、普通卡 {commandCards.VisibleNormalCardCount} 张，等待画面稳定后优先选宝具。"
-                        : $"已识别宝具 {commandCards.VisibleNoblePhantasmCount} 张、普通卡 {commandCards.VisibleNormalCardCount} 张，需要合计至少三张；继续等待完整画面。";
-                ReportRunObservation(StatusText);
-                // A partial/spurious card match must not block visible ordinary buttons.
-                // Once a hand has been selected, keep its existing duplicate-click protection.
-                if (commandCards.HasSelectedCards && !useOrdinaryButtons)
-                    continue;
-                incompleteCardStatus = StatusText;
-            }
-
-            var newlyVisible = new List<(ImageClickRule Rule, ImageMatchHit Hit)>();
-            var now = DateTime.UtcNow;
-
-            foreach (var rule in rules)
-            {
-                if (rule.IsCardRule)
-                    continue;
-                if (!evaluationById.TryGetValue(rule.Target.Id, out var evaluation))
+                string? incompleteCardStatus = null;
+                if (commandCards.VisibleCardCount > 0 && !useOrdinaryButtons)
                 {
-                    rule.WasVisible = false;
-                    continue;
-                }
-                if (evaluation.IsAmbiguous)
-                {
-                    rule.WasVisible = false;
-                    continue;
-                }
-                if (evaluation.Hit is null)
-                {
-                    rule.WasVisible = false;
-                    continue;
+                    StatusText = commandCards.IsComplete
+                        ? "本轮三张卡已选完，等待选卡界面结束，不重复点击。"
+                        : commandCards.WaitingForSettle
+                            ? $"已识别宝具 {commandCards.VisibleNoblePhantasmCount} 张、普通卡 {commandCards.VisibleNormalCardCount} 张，等待画面稳定后优先选宝具。"
+                            : $"已识别宝具 {commandCards.VisibleNoblePhantasmCount} 张、普通卡 {commandCards.VisibleNormalCardCount} 张，需要合计至少三张；继续等待完整画面。";
+                    ReportRunObservation(StatusText);
+                    // A partial/spurious card match must not block visible ordinary buttons.
+                    // Once a hand has been selected, keep its existing duplicate-click protection.
+                    if (commandCards.HasSelectedCards && !useOrdinaryButtons)
+                        continue;
+                    incompleteCardStatus = StatusText;
                 }
 
-                if (!rule.WasVisible && (now - rule.LastTriggeredUtc).TotalMilliseconds >= 900)
-                    newlyVisible.Add((rule, evaluation.Hit));
-            }
+                var newlyVisible = new List<(ImageClickRule Rule, ImageMatchHit Hit)>();
+                var now = DateTime.UtcNow;
 
-            var clickTimer = Stopwatch.StartNew();
-            if (newlyVisible.Count > 0)
-            {
-                var match = newlyVisible.OrderByDescending(candidate => candidate.Hit.Score).First();
-                RunStageText = $"点击“{match.Rule.Target.Name}”";
-                var guardedClick = await TryTapVerifiedAsync(frame, match.Rule, match.Hit, cancellationToken);
-                clickTimer.Stop();
-                if (!guardedClick.Clicked)
+                foreach (var rule in rules)
                 {
-                    StatusText = $"画面已变化或识别已过期，已取消“{match.Rule.Target.Name}”点击并重新识别（{guardedClick.Reason}）。";
-                    ReportRunObservation(StatusText);
-                    continue;
+                    if (rule.IsCardRule)
+                        continue;
+                    if (!evaluationById.TryGetValue(rule.Target.Id, out var evaluation))
+                    {
+                        rule.WasVisible = false;
+                        continue;
+                    }
+                    if (evaluation.IsAmbiguous)
+                    {
+                        rule.WasVisible = false;
+                        continue;
+                    }
+                    if (evaluation.Hit is null)
+                    {
+                        rule.WasVisible = false;
+                        continue;
+                    }
+
+                    if (!rule.WasVisible && (now - rule.LastTriggeredUtc).TotalMilliseconds >= 900)
+                        newlyVisible.Add((rule, evaluation.Hit));
                 }
-                var reachedLimit = match.Rule.RegisterSuccessfulTrigger();
-                cycleTimer.Stop();
-                var action = match.Rule.PreferTopmostMatch ? "已点击最上方匹配项" : "已点击中心";
-                StatusText = newlyVisible.Count > 1
-                    ? $"同时命中多条规则，已点击匹配度最高的“{match.Rule.Target.Name}”（{match.Hit.Score:P1}）；本轮 {cycleTimer.Elapsed.TotalSeconds:F1} 秒。"
-                    : $"命中“{match.Rule.Target.Name}”（{match.Hit.Score:P1}），{action}；本轮 {cycleTimer.Elapsed.TotalSeconds:F1} 秒。";
-                AddLog($"{StatusText} {match.Rule.TriggerCountDisplay}；gRPC 新帧 {captureTimer.Elapsed.TotalSeconds:F2}s，匹配 {matchTimer.Elapsed.TotalSeconds:F2}s，点击 {clickTimer.Elapsed.TotalSeconds:F2}s；坐标 ({match.Hit.CenterX}, {match.Hit.CenterY})。");
-                if (reachedLimit)
+
+                var clickTimer = Stopwatch.StartNew();
+                if (newlyVisible.Count > 0)
                 {
-                    StopAtTriggerLimit(match.Rule);
-                    return;
-                }
-            }
-            else
-            {
-                cycleTimer.Stop();
-                var ambiguousNames = rules.Where(rule => ambiguityReported.Contains(rule.Target.Id)).Select(rule => rule.Target.Name).Take(3).ToArray();
-                StatusText = ambiguousNames.Length > 0
-                    ? $"“{string.Join("、", ambiguousNames)}”命中多处，当前要求唯一而未点击；列表目标可启用“多处命中选最上方”。"
-                    : $"持续监控中：本轮 {cycleTimer.Elapsed.TotalSeconds:F2}s（gRPC 新帧 {captureTimer.Elapsed.TotalSeconds:F2}s，匹配 {matchTimer.Elapsed.TotalSeconds:F2}s）。";
-                var visible = rules.Where(rule => !rule.IsCardRule && evaluationById.TryGetValue(rule.Target.Id, out var e) && e.Hit is not null).Select(rule => rule.Target.Name).Take(3).ToArray();
-                if (visible.Length == 0 && incompleteCardStatus is not null)
-                {
-                    StatusText = incompleteCardStatus;
-                    ReportRunObservation(StatusText);
-                }
-                else if (ambiguousNames.Length > 0)
-                    ReportRunObservation(StatusText);
-                else if (visible.Length > 0)
-                {
-                    StatusText = $"已识别“{string.Join("、", visible)}”，当前等待目标消失后重新触发或点击冷却结束。";
-                    ReportRunObservation(StatusText);
+                    var match = newlyVisible.OrderByDescending(candidate => candidate.Hit.Score).First();
+                    RunStageText = $"点击“{match.Rule.Target.Name}”";
+                    var guardedClick = await TryTapVerifiedAsync(frame, match.Rule, match.Hit, cancellationToken, recognitionEpoch);
+                    clickTimer.Stop();
+                    if (!guardedClick.Clicked)
+                    {
+                        StatusText = $"画面已变化或识别已过期，已取消“{match.Rule.Target.Name}”点击并重新识别（{guardedClick.Reason}）。";
+                        ReportRunObservation(StatusText);
+                        continue;
+                    }
+                    var reachedLimit = match.Rule.RegisterSuccessfulTrigger();
+                    cycleTimer.Stop();
+                    var action = match.Rule.PreferTopmostMatch ? "已点击最上方匹配项" : "已点击中心";
+                    StatusText = newlyVisible.Count > 1
+                        ? $"同时命中多条规则，已点击匹配度最高的“{match.Rule.Target.Name}”（{match.Hit.Score:P1}）；本轮 {cycleTimer.Elapsed.TotalSeconds:F1} 秒。"
+                        : $"命中“{match.Rule.Target.Name}”（{match.Hit.Score:P1}），{action}；本轮 {cycleTimer.Elapsed.TotalSeconds:F1} 秒。";
+                    AddLog($"{StatusText} {match.Rule.TriggerCountDisplay}；gRPC 新帧 {captureTimer.Elapsed.TotalSeconds:F2}s，匹配 {matchTimer.Elapsed.TotalSeconds:F2}s，点击 {clickTimer.Elapsed.TotalSeconds:F2}s；坐标 ({match.Hit.CenterX}, {match.Hit.CenterY})。");
+                    if (reachedLimit)
+                    {
+                        StopAtTriggerLimit(match.Rule);
+                        return;
+                    }
                 }
                 else
                 {
-                    var best = evaluations.MaxBy(e => e.BestScore);
-                    var bestRule = best is null ? null : rules.FirstOrDefault(rule => rule.Target.Id == best.Id);
-                    StatusText = bestRule is null ? "当前画面未命中规则。"
-                        : $"当前画面未命中可执行规则；最高“{bestRule.Target.Name}”{best!.BestScore:P1}，阈值 {bestRule.Threshold:P0}。";
-                    ReportRunObservation(StatusText);
+                    cycleTimer.Stop();
+                    var ambiguousNames = rules.Where(rule => ambiguityReported.Contains(rule.Target.Id)).Select(rule => rule.Target.Name).Take(3).ToArray();
+                    StatusText = ambiguousNames.Length > 0
+                        ? $"“{string.Join("、", ambiguousNames)}”命中多处，当前要求唯一而未点击；列表目标可启用“多处命中选最上方”。"
+                        : $"持续监控中：本轮 {cycleTimer.Elapsed.TotalSeconds:F2}s（gRPC 新帧 {captureTimer.Elapsed.TotalSeconds:F2}s，匹配 {matchTimer.Elapsed.TotalSeconds:F2}s）。";
+                    var visible = rules.Where(rule => !rule.IsCardRule && evaluationById.TryGetValue(rule.Target.Id, out var e) && e.Hit is not null).Select(rule => rule.Target.Name).Take(3).ToArray();
+                    if (visible.Length == 0 && incompleteCardStatus is not null)
+                    {
+                        StatusText = incompleteCardStatus;
+                        ReportRunObservation(StatusText);
+                    }
+                    else if (ambiguousNames.Length > 0)
+                        ReportRunObservation(StatusText);
+                    else if (visible.Length > 0)
+                    {
+                        StatusText = $"已识别“{string.Join("、", visible)}”，当前等待目标消失后重新触发或点击冷却结束。";
+                        ReportRunObservation(StatusText);
+                    }
+                    else
+                    {
+                        var best = evaluations.MaxBy(e => e.BestScore);
+                        var bestRule = best is null ? null : rules.FirstOrDefault(rule => rule.Target.Id == best.Id);
+                        StatusText = bestRule is null ? "当前画面未命中规则。"
+                            : $"当前画面未命中可执行规则；最高“{bestRule.Target.Name}”{best!.BestScore:P1}，阈值 {bestRule.Threshold:P0}。";
+                        ReportRunObservation(StatusText);
+                    }
                 }
+            }
+            catch (InvalidOperationException) when (_emulator.Diagnostics.IsRecognitionPaused
+                || recognitionEpoch != _emulator.Diagnostics.RecognitionEpoch)
+            {
+                // The diagnostic can pause the stream between the pre-check and
+                // an awaited fresh-frame request. Resume the loop, not old work.
+                continue;
             }
         }
     }
@@ -986,8 +1022,11 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     }
 
     private async Task<(bool Clicked, string Reason)> TryTapVerifiedAsync(
-        GameFrame referenceFrame, ImageClickRule rule, ImageMatchHit expectedHit, CancellationToken cancellationToken)
+        GameFrame referenceFrame, ImageClickRule rule, ImageMatchHit expectedHit, CancellationToken cancellationToken,
+        long recognitionEpoch)
     {
+        if (_emulator.Diagnostics.IsRecognitionPaused || recognitionEpoch != _emulator.Diagnostics.RecognitionEpoch)
+            return (false, "性能诊断已暂停或更改，重新识别后才能点击");
         if (referenceFrame.Age > TimeSpan.FromMilliseconds(900))
             return (false, "匹配所用画面已过期");
 
@@ -1003,6 +1042,8 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             return (false, "目标在点击前已移动或消失");
         if (freshFrame.Age > TimeSpan.FromMilliseconds(700))
             return (false, "目标复核耗时过长，画面已过期");
+        if (_emulator.Diagnostics.IsRecognitionPaused || recognitionEpoch != _emulator.Diagnostics.RecognitionEpoch)
+            return (false, "复核期间性能诊断已更改，已取消点击");
 
         var pressed = false;
         try
@@ -1048,7 +1089,8 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             ClearVideoBitmap();
             LivePreviewStatus = "Android 模拟器未运行";
         }
-        else if (!_emulator.HasLiveScreenshotStream && status.Contains("截图流", StringComparison.OrdinalIgnoreCase))
+        else if (!_emulator.HasLiveScreenshotStream && !_emulator.Diagnostics.IsScreenshotStreamPaused
+            && status.Contains("截图流", StringComparison.OrdinalIgnoreCase))
         {
             _ = _previewTouches.CancelPendingAsync();
             ClearVideoBitmap();
@@ -1161,6 +1203,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         _emulator.StatusChanged -= OnEmulatorServiceStatusChanged;
         _emulator.LogReceived -= OnEmulatorLogReceived;
         _emulator.Dispose();
+        _imageMatcher.Dispose();
         _runLog.Dispose();
     }
 

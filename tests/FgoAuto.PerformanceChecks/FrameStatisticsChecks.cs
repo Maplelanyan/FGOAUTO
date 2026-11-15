@@ -5,6 +5,12 @@ internal static class FrameStatisticsChecks
 {
     public static void Run()
     {
+        var unarySequence = new FrameStatistics();
+        unarySequence.Record(42, At(0));
+        unarySequence.Record(-1, At(16));
+        unarySequence.Record(43, At(32));
+        Require(unarySequence.GetSnapshot(At(32)).SourceSkippedFrames == 0,
+            "Unary resume confirmation manufactured a streaming sequence gap.");
         CheckLongGapsAndIdle();
         CheckFixedWindowAndBounds();
         CheckSourceDeliveryTiming();

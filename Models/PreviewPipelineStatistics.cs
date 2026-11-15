@@ -4,7 +4,7 @@ namespace FgoAuto.Models;
 
 public sealed record PreviewPipelineStatisticsSnapshot(TimingStatisticsSnapshot Conversion,
     TimingStatisticsSnapshot ReceiveToPreview, TimingStatisticsSnapshot PreviewToUi,
-    TimingStatisticsSnapshot UiCopy, TimingStatisticsSnapshot ReceiveToDraw);
+    TimingStatisticsSnapshot UiCopy, TimingStatisticsSnapshot ReceiveToDraw, long ConvertedFrames = 0);
 
 /// <summary>
 /// Bounded five-second observations of work AFTER a complete frame arrives.
@@ -13,6 +13,7 @@ public sealed record PreviewPipelineStatisticsSnapshot(TimingStatisticsSnapshot 
 public sealed class PreviewPipelineStatistics
 {
     private readonly object _sync = new();
+    private long _convertedFrames;
     private readonly RecentTimingSamples _conversion = new(), _receiveToPreview = new(),
         _previewToUi = new(), _uiCopy = new(), _receiveToDraw = new();
 
@@ -20,6 +21,7 @@ public sealed class PreviewPipelineStatistics
     {
         lock (_sync)
         {
+            _convertedFrames++;
             Record(_conversion, startedAt, completedAt);
             Record(_receiveToPreview, frame.ReceivedAtTimestamp, completedAt);
         }
@@ -44,13 +46,14 @@ public sealed class PreviewPipelineStatistics
         if (nowTimestamp == 0) nowTimestamp = Stopwatch.GetTimestamp();
         lock (_sync)
             return new(_conversion.GetSnapshot(nowTimestamp), _receiveToPreview.GetSnapshot(nowTimestamp),
-                _previewToUi.GetSnapshot(nowTimestamp), _uiCopy.GetSnapshot(nowTimestamp), _receiveToDraw.GetSnapshot(nowTimestamp));
+                _previewToUi.GetSnapshot(nowTimestamp), _uiCopy.GetSnapshot(nowTimestamp), _receiveToDraw.GetSnapshot(nowTimestamp), _convertedFrames);
     }
 
     public void Reset()
     {
         lock (_sync)
         {
+            _convertedFrames = 0;
             _conversion.Clear(); _receiveToPreview.Clear(); _previewToUi.Clear();
             _uiCopy.Clear(); _receiveToDraw.Clear();
         }

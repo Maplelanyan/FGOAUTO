@@ -6,7 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <DefaultItemExcludes>$(DefaultItemExcludes);obj\**;bin\**;.build-tools\**;tests\**</DefaultItemExcludes>
+    <DefaultItemExcludes>$(DefaultItemExcludes);obj\**;bin\**;.build-tools\**;tests\**;tools\**</DefaultItemExcludes>
     <ApplicationIcon>Assets\platform.ico</ApplicationIcon>
   </PropertyGroup>
 
