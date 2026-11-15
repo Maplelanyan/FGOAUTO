@@ -154,7 +154,8 @@ internal sealed class EmulatorGrpcClient : IDisposable
             using var bgra = Mat.FromPixelData(frame.Height, frame.Width, MatType.CV_8UC4,
                 destinationHandle.AddrOfPinnedObject(), frame.Width * 4L);
             Cv2.CvtColor(rgb, bgra, ColorConversionCodes.RGB2BGRA);
-            return new VideoPreviewFrame(frame.Width, frame.Height, pixels, frame.FrameId, frame.NativeWidth, frame.NativeHeight);
+            return new VideoPreviewFrame(frame.Width, frame.Height, pixels, frame.FrameId, frame.NativeWidth, frame.NativeHeight,
+                frame.ReceivedAtTimestamp, Stopwatch.GetTimestamp());
         }
         catch
         {
@@ -234,12 +235,16 @@ internal sealed class EmulatorGrpcClient : IDisposable
             throw new InvalidDataException($"模拟器返回了不支持的画面数据（{width} × {height}，{pixelFormat}，{pixels.Length} 字节）。");
 
         var capturedAt = receivedAt;
+        var hasSourceTimestamp = false;
         var nowUs = (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1000L);
         if (timestampUs > 0 && timestampUs <= (ulong)nowUs)
         {
             var ageUs = nowUs - (long)timestampUs;
             if (ageUs < 86_400_000_000L)
+            {
                 capturedAt -= (long)(ageUs / 1_000_000d * Stopwatch.Frequency);
+                hasSourceTimestamp = true;
+            }
         }
         // Templates keep the original 1920x1080 coordinate space even when the
         // Android display itself uses the lower game-rendering resolution.
@@ -247,7 +252,7 @@ internal sealed class EmulatorGrpcClient : IDisposable
         var nativeWidth = width >= height ? 1920 : 1080;
         var nativeHeight = width >= height ? 1080 : 1920;
         return new GameFrame(width, height, pixels, Interlocked.Increment(ref _frameNumber), capturedAt,
-            nativeWidth, nativeHeight, receivedAt);
+            nativeWidth, nativeHeight, receivedAt, hasSourceTimestamp);
     }
 
     private static (int Width, int Height, int Format) DecodeImageFormat(byte[] bytes)

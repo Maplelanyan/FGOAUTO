@@ -48,6 +48,7 @@ public sealed class ScreenshotPreview : Control
     private bool _touchActive;
     private PixelPoint _lastTouchPoint;
     private long _lastTouchTimestamp;
+    private IPointer? _touchPointer;
 
     public long FrameNumber { get => GetValue(FrameNumberProperty); set => SetValue(FrameNumberProperty, value); }
     public bool IsInteractive { get => GetValue(IsInteractiveProperty); set => SetValue(IsInteractiveProperty, value); }
@@ -71,6 +72,8 @@ public sealed class ScreenshotPreview : Control
     /// <summary>Raised when a distinct live frame is submitted to DrawImage, before compositor presentation.</summary>
     public event EventHandler<PreviewFrameRenderedEventArgs>? FrameRendered;
 
+    public void CancelTouch() => EndTouch(_lastTouchPoint);
+
     static ScreenshotPreview()
     {
         AffectsRender<ScreenshotPreview>(SourceProperty, IsSelectingProperty, FrameNumberProperty, IsInteractiveProperty);
@@ -81,6 +84,10 @@ public sealed class ScreenshotPreview : Control
         base.OnPropertyChanged(change);
         if (change.Property == FrameNumberProperty && FrameNumber <= 0)
             _lastRenderedFrame = -1;
+        if ((change.Property == IsInteractiveProperty && !IsInteractive)
+            || (change.Property == IsSelectingProperty && IsSelecting)
+            || (change.Property == SourceProperty && Source is null))
+            EndTouch(_lastTouchPoint);
     }
 
     public override void Render(DrawingContext context)
@@ -135,6 +142,7 @@ public sealed class ScreenshotPreview : Control
             _touchActive = true;
             _lastTouchPoint = point;
             _lastTouchTimestamp = Stopwatch.GetTimestamp();
+            _touchPointer = e.Pointer;
             e.Pointer.Capture(this);
             TouchUpdated?.Invoke(this, new EmulatorTouchEventArgs(point.X, point.Y, 1));
             e.Handled = true;
@@ -184,12 +192,10 @@ public sealed class ScreenshotPreview : Control
         base.OnPointerReleased(e);
         if (_touchActive)
         {
+            var releasePoint = _lastTouchPoint;
             if (Source is { } touchBitmap && TryMapToSource(touchBitmap, e.GetPosition(this), clamp: true, out var touchPoint))
-                TouchUpdated?.Invoke(this, new EmulatorTouchEventArgs(touchPoint.X, touchPoint.Y, 0));
-            else
-                TouchUpdated?.Invoke(this, new EmulatorTouchEventArgs(_lastTouchPoint.X, _lastTouchPoint.Y, 0));
-            _touchActive = false;
-            e.Pointer.Capture(null);
+                releasePoint = touchPoint;
+            EndTouch(releasePoint);
             e.Handled = true;
             return;
         }
@@ -197,15 +203,40 @@ public sealed class ScreenshotPreview : Control
             return;
 
         var hasEnd = TryMapToSource(bitmap, e.GetPosition(this), clamp: true, out var end);
-        e.Pointer.Capture(null);
-        _dragStart = null;
         var region = hasEnd ? PixelRegion.FromPoints(start, end) : _selection;
+        _dragStart = null;
         _selection = null;
+        e.Pointer.Capture(null);
         InvalidateVisual();
 
         if (region is { } completed)
             SelectionCompleted?.Invoke(this, new SelectionRegionEventArgs(completed.Left, completed.Top, completed.Width, completed.Height));
         e.Handled = true;
+    }
+
+    protected override void OnPointerCaptureLost(PointerCaptureLostEventArgs e)
+    {
+        base.OnPointerCaptureLost(e);
+        EndTouch(_lastTouchPoint);
+        _dragStart = null;
+        _selection = null;
+        InvalidateVisual();
+    }
+
+    protected override void OnDetachedFromVisualTree(VisualTreeAttachmentEventArgs e)
+    {
+        EndTouch(_lastTouchPoint);
+        base.OnDetachedFromVisualTree(e);
+    }
+
+    private void EndTouch(PixelPoint point)
+    {
+        if (!_touchActive) return;
+        _touchActive = false;
+        var pointer = _touchPointer;
+        _touchPointer = null;
+        TouchUpdated?.Invoke(this, new EmulatorTouchEventArgs(point.X, point.Y, 0));
+        pointer?.Capture(null);
     }
 
     private void RaiseSelectionUpdated(PixelRegion region) =>

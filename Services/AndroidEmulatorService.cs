@@ -37,6 +37,8 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
     private VideoPreviewFrame? _pendingPreview;
     private GameFrame? _latestFrame;
     private readonly string _videoSettingsPath;
+    private readonly object _videoSettingsSync = new();
+    private bool _lastLaunchedOpenGlMode;
     private TaskCompletionSource _firstFrame = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private bool _disposed;
     private string _status = "尚未准备 Android 模拟器";
@@ -52,8 +54,13 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
         _videoSettingsPath = Path.Combine(_runtimeRoot, "video-settings.json");
         try
         {
-            if (File.Exists(_videoSettingsPath))
-                UsePerformanceMode = JsonSerializer.Deserialize<VideoSettings>(File.ReadAllText(_videoSettingsPath))?.UsePerformanceMode ?? false;
+            if (File.Exists(_videoSettingsPath)
+                && JsonSerializer.Deserialize<VideoSettings>(File.ReadAllText(_videoSettingsPath)) is { } settings)
+            {
+                UsePerformanceMode = settings.UsePerformanceMode;
+                UseOpenGlMode = settings.UseOpenGlMode;
+                _lastLaunchedOpenGlMode = settings.LastLaunchedOpenGlMode;
+            }
         }
         catch (Exception error) when (error is IOException or JsonException or UnauthorizedAccessException) { }
     }
@@ -68,7 +75,9 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
         && _streamTask is { IsCompleted: false } && _previewTask is { IsCompleted: false };
     public bool HasPendingPreviewFrame => Volatile.Read(ref _pendingPreview) is not null;
     public bool UsePerformanceMode { get; private set; }
+    public bool UseOpenGlMode { get; private set; }
     public FrameStatistics FrameStatistics { get; } = new();
+    public PreviewPipelineStatistics PreviewStatistics { get; } = new();
     public bool IsPrepared => File.Exists(Path.Combine(_sdkRoot, "emulator", "emulator.exe"))
         && File.Exists(Path.Combine(_sdkRoot, "platform-tools", "adb.exe"))
         && File.Exists(Path.Combine(_sdkRoot, "system-images", "android-34", "google_apis_playstore", "x86_64", "system.img"))
@@ -78,9 +87,35 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
 
     public void SetPerformanceMode(bool enabled)
     {
+        lock (_videoSettingsSync)
+        {
+            WriteVideoSettings(new VideoSettings(enabled, UseOpenGlMode, _lastLaunchedOpenGlMode));
+            UsePerformanceMode = enabled;
+        }
+    }
+
+    public void SetOpenGlMode(bool enabled)
+    {
+        lock (_videoSettingsSync)
+        {
+            WriteVideoSettings(new VideoSettings(UsePerformanceMode, enabled, _lastLaunchedOpenGlMode));
+            UseOpenGlMode = enabled;
+        }
+    }
+
+    private void WriteVideoSettings(VideoSettings settings)
+    {
         Directory.CreateDirectory(_runtimeRoot);
-        File.WriteAllText(_videoSettingsPath, JsonSerializer.Serialize(new VideoSettings(enabled)));
-        UsePerformanceMode = enabled;
+        var temporaryPath = _videoSettingsPath + $".{Guid.NewGuid():N}.tmp";
+        try
+        {
+            File.WriteAllText(temporaryPath, JsonSerializer.Serialize(settings));
+            File.Move(temporaryPath, _videoSettingsPath, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
+        }
     }
 
     public async Task PrepareAsync(bool userAcceptedRequiredLicenses, IProgress<string>? progress = null, CancellationToken cancellationToken = default)
@@ -139,7 +174,14 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
 
             Directory.CreateDirectory(_userHome);
             lock (_outputLock) _lastRuntimeOutput = string.Empty;
-            var profile = EmulatorGameProfile.Create(UsePerformanceMode);
+            // Freeze launch options so changes made while booting only apply on restart.
+            bool performanceMode, openGlMode;
+            lock (_videoSettingsSync)
+            {
+                performanceMode = UsePerformanceMode;
+                openGlMode = UseOpenGlMode;
+            }
+            var profile = EmulatorGameProfile.Create(performanceMode);
             var profileChanged = profile.ApplyToConfig(Path.Combine(_avdDirectory, "config.ini"));
             var startArguments = new List<string>
             {
@@ -148,8 +190,11 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
             };
             // A saved VM snapshot retains the old display hardware. Changing the
             // profile must cold boot once; installed apps and user data are retained.
-            if (profileChanged) startArguments.Add("-no-snapshot-load");
-            LogReceived?.Invoke($"游戏运行配置：Android 实际渲染 {profile.Width} × {profile.Height} @ {profile.Density} dpi；主机 GPU；关闭摄像头、GPS、麦克风；模板逻辑坐标仍为 1920 × 1080。" );
+            if (profileChanged || openGlMode != _lastLaunchedOpenGlMode) startArguments.Add("-no-snapshot-load");
+            if (openGlMode) startArguments.AddRange(["-feature", "-Vulkan"]);
+            LogReceived?.Invoke($"游戏运行配置：Android 实际渲染 {profile.Width} × {profile.Height} @ {profile.Density} dpi；主机 GPU；"
+                + $"{(openGlMode ? "OpenGL 游戏模式（关闭客体 Vulkan）" : "标准图形模式（保留 Vulkan）")}；"
+                + "关闭摄像头、GPS、麦克风；模板逻辑坐标仍为 1920 × 1080。" );
             var startInfo = CreateProcessStartInfo(emulatorExe, startArguments);
             _emulatorProcess = new Process { StartInfo = startInfo, EnableRaisingEvents = true };
             _emulatorProcess.OutputDataReceived += (_, e) => { if (!string.IsNullOrWhiteSpace(e.Data)) AppendRuntimeOutput(e.Data); };
@@ -162,7 +207,7 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
 
             var credential = await WaitForGrpcCredentialsAsync(_emulatorProcess, cancellationToken).ConfigureAwait(false);
             _grpc = new EmulatorGrpcClient(credential.Port, credential.Token,
-                maxWidth: UsePerformanceMode ? 1280 : 0, maxHeight: UsePerformanceMode ? 1280 : 0,
+                maxWidth: performanceMode ? 1280 : 0, maxHeight: performanceMode ? 1280 : 0,
                 deviceWidth: profile.Width, deviceHeight: profile.Height);
             SetStatus("Android 系统启动中…");
             progress?.Report(Status);
@@ -187,9 +232,21 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
             }
             if (!booted) throw new TimeoutException("Android 系统在 4 分钟内没有完成启动。请停止模拟器后重试。" + Environment.NewLine + LastRuntimeOutput);
 
+            try
+            {
+                lock (_videoSettingsSync)
+                {
+                    _lastLaunchedOpenGlMode = openGlMode;
+                    WriteVideoSettings(new VideoSettings(UsePerformanceMode, UseOpenGlMode, _lastLaunchedOpenGlMode));
+                }
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            { LogReceived?.Invoke($"无法保存上次图形模式，下次启动可能重新冷启动：{error.Message}"); }
+
             _streamCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             _firstFrame = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             FrameStatistics.Reset();
+            PreviewStatistics.Reset();
             var streamToken = _streamCancellation.Token;
             var client = _grpc;
             _previewTask = Task.Run(() => RunPreviewConversionAsync(streamToken), streamToken);
@@ -615,7 +672,8 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
     private void ReceiveFrame(GameFrame frame, long sourceSequence)
     {
         Volatile.Write(ref _latestFrame, frame);
-        FrameStatistics.Record(sourceSequence, frame.ReceivedAtTimestamp);
+        FrameStatistics.Record(sourceSequence, frame.ReceivedAtTimestamp,
+            frame.HasSourceTimestamp ? frame.CapturedAtTimestamp : 0);
         try { _previewSignal.Release(); }
         catch (SemaphoreFullException) { } // Only a single latest-frame notification is needed.
     }
@@ -630,7 +688,9 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
                 await _previewSignal.WaitAsync(cancellationToken).ConfigureAwait(false);
                 var frame = Volatile.Read(ref _latestFrame);
                 if (frame is null || frame.FrameId == lastConverted) continue;
+                var conversionStartedAt = Stopwatch.GetTimestamp();
                 var preview = EmulatorGrpcClient.ToPreviewFrame(frame);
+                PreviewStatistics.RecordConversion(frame, conversionStartedAt, preview.PreviewReadyAtTimestamp);
                 lastConverted = frame.FrameId;
                 Interlocked.Exchange(ref _pendingPreview, preview)?.Dispose();
                 _firstFrame.TrySetResult();
@@ -738,5 +798,5 @@ public sealed class AndroidEmulatorService : IDisposable, IAsyncDisposable
     public void Dispose() => DisposeAsync().AsTask().GetAwaiter().GetResult();
 
     private sealed record ProcessResult(int ExitCode, string Output);
-    private sealed record VideoSettings(bool UsePerformanceMode);
+    private sealed record VideoSettings(bool UsePerformanceMode, bool UseOpenGlMode = false, bool LastLaunchedOpenGlMode = false);
 }

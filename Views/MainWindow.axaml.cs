@@ -6,9 +6,12 @@ namespace FgoAuto.Views;
 
 public partial class MainWindow : Window
 {
+    private ScreenshotPreview? _activeTouchPreview;
+
     public MainWindow()
     {
         InitializeComponent();
+        Deactivated += (_, _) => _activeTouchPreview?.CancelTouch();
     }
 
     private void OnPreviewSelectionUpdated(object? sender, SelectionRegionEventArgs e)
@@ -23,10 +26,11 @@ public partial class MainWindow : Window
             viewModel.CreateTemplateFromSelection(e.Left, e.Top, e.Width, e.Height);
     }
 
-    private async void OnPreviewTouchUpdated(object? sender, EmulatorTouchEventArgs e)
+    private void OnPreviewTouchUpdated(object? sender, EmulatorTouchEventArgs e)
     {
+        _activeTouchPreview = e.Pressure > 0 ? sender as ScreenshotPreview : null;
         if (DataContext is MainViewModel viewModel)
-            await viewModel.SendPreviewTouchAsync(e.X, e.Y, e.Pressure);
+            viewModel.QueuePreviewTouch(e.X, e.Y, e.Pressure);
     }
 
     private void OnPreviewFrameRendered(object? sender, PreviewFrameRenderedEventArgs e)

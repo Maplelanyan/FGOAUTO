@@ -11,7 +11,8 @@ namespace FgoAuto.Models;
 public sealed class GameFrame
 {
     public GameFrame(int width, int height, ReadOnlyMemory<byte> rgbPixels, long frameId,
-        long capturedAtTimestamp, int nativeWidth = 0, int nativeHeight = 0, long receivedAtTimestamp = 0)
+        long capturedAtTimestamp, int nativeWidth = 0, int nativeHeight = 0, long receivedAtTimestamp = 0,
+        bool hasSourceTimestamp = false)
     {
         if (width <= 0) throw new ArgumentOutOfRangeException(nameof(width));
         if (height <= 0) throw new ArgumentOutOfRangeException(nameof(height));
@@ -28,6 +29,7 @@ public sealed class GameFrame
         FrameId = frameId;
         CapturedAtTimestamp = capturedAtTimestamp;
         ReceivedAtTimestamp = receivedAtTimestamp == 0 ? capturedAtTimestamp : receivedAtTimestamp;
+        HasSourceTimestamp = hasSourceTimestamp;
     }
 
     public int Width { get; }
@@ -38,6 +40,8 @@ public sealed class GameFrame
     public long FrameId { get; }
     public long CapturedAtTimestamp { get; }
     public long ReceivedAtTimestamp { get; }
+    /// <summary>True only when the emulator supplied a usable generation-time estimate.</summary>
+    public bool HasSourceTimestamp { get; }
     public TimeSpan Age => Stopwatch.GetElapsedTime(CapturedAtTimestamp);
 
     /// <summary>Returns an independent grayscale image in the native coordinate space.</summary>

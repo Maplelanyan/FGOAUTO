@@ -68,6 +68,8 @@
                     <Button Classes="secondary" Command="{Binding SelectTemplateCommand}" Content="框选图片目标" IsEnabled="{Binding CanOperateEmulator}" />
                     <CheckBox Content="720p 游戏性能模式" IsChecked="{Binding UsePerformanceMode}" IsEnabled="{Binding !IsRunning}" VerticalAlignment="Center"
                               ToolTip.Tip="重启模拟器后生效。将 Android 和游戏实际渲染降为 1280×720，降低图形负担；旧模板和点击坐标自动换算。" />
+                    <CheckBox Content="OpenGL 游戏模式" IsChecked="{Binding UseOpenGlMode}" IsEnabled="{Binding !IsRunning}" VerticalAlignment="Center"
+                              ToolTip.Tip="重启模拟器后生效，保持显卡加速。可改善部分画面卡顿或纹理异常；游戏无法启动时请取消此项。" />
                 </WrapPanel>
                 <TextBlock Text="{Binding StatusText}" Classes="muted" Margin="2,0,0,0" TextWrapping="Wrap" />
                 <Grid ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto" ColumnSpacing="8" IsVisible="{Binding IsPreparingEmulator}">

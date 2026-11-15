@@ -22,7 +22,8 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     private readonly string _legacyRulesPath;
     private readonly RunLogWriter _runLog;
     private readonly Dictionary<string, DateTime> _runObservations = [];
-    private readonly SemaphoreSlim _touchSendGate = new(1, 1);
+    private readonly PreviewTouchDispatcher _previewTouches;
+    private bool _previewTouchLifecycleBusy;
     private CancellationTokenSource? _runCancellation;
     private byte[]? _latestScreenshot;
     private bool _disposed;
@@ -62,6 +63,20 @@ public partial class MainViewModel : ViewModelBase, IDisposable
 
     [ObservableProperty]
     public partial bool UsePerformanceMode { get; set; }
+
+    [ObservableProperty]
+    public partial bool UseOpenGlMode { get; set; }
+
+    partial void OnUseOpenGlModeChanged(bool value)
+    {
+        try
+        {
+            _emulator.SetOpenGlMode(value);
+            StatusText = value ? "已选择 OpenGL 游戏模式，重启模拟器后生效；游戏无法启动时可取消此项。"
+                : "已选择标准图形模式，重启模拟器后生效。";
+        }
+        catch (Exception error) { StatusText = $"无法保存图形模式：{error.Message}"; }
+    }
 
     partial void OnUsePerformanceModeChanged(bool value)
     {
@@ -136,7 +151,18 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         _legacyRulesPath = Path.Combine(_localDirectory, "click-rules.txt");
         _runLog = new RunLogWriter(_localDirectory);
         _emulator = new AndroidEmulatorService(_localDirectory);
+        _previewTouches = new PreviewTouchDispatcher((x, y, pressure, token) =>
+            _emulator.IsRunning
+                ? _emulator.SendTouchAsync(x, y, pressure, identifier: 2, cancellationToken: token)
+                : Task.CompletedTask,
+            error => Dispatcher.UIThread.Post(() =>
+            {
+                if (_disposed) return;
+                StatusText = $"模拟器触控失败：{error.Message}";
+                AddLog(StatusText);
+            }));
         UsePerformanceMode = _emulator.UsePerformanceMode;
+        UseOpenGlMode = _emulator.UseOpenGlMode;
         _emulator.FrameAvailable += OnEmulatorFrameAvailable;
         _emulator.StatusChanged += OnEmulatorServiceStatusChanged;
         _emulator.LogReceived += OnEmulatorLogReceived;
@@ -147,6 +173,9 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         LoadImageTargets();
         LoadRuleSetsFromDisk();
         AddLog("FgoAuto 将使用本机管理的 Android 14 模拟器；图片模板和规则套装已载入。");
+        AddLog($"运行环境：.NET {Environment.Version}；{(Environment.Is64BitProcess ? "64" : "32")} 位；"
+            + $"GC {(System.Runtime.GCSettings.IsServerGC ? "Server" : "Workstation")} / {System.Runtime.GCSettings.LatencyMode}；"
+            + $"逻辑处理器 {Environment.ProcessorCount}。性能日志中的 GC 和分配统计仅属于 FgoAuto 进程。");
     }
 
     [RelayCommand]
@@ -246,6 +275,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
     [RelayCommand]
     private async Task StopEmulatorAsync()
     {
+        _previewTouchLifecycleBusy = true;
         try
         {
             await StopAutomationBeforeLifecycleChangeAsync();
@@ -254,11 +284,13 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             StatusText = _emulator.Status;
         }
         catch (Exception exception) { if (!_disposed) { StatusText = exception.Message; AddLog(exception.Message); } }
+        finally { _previewTouchLifecycleBusy = false; }
     }
 
     [RelayCommand]
     private async Task RestartEmulatorAsync()
     {
+        _previewTouchLifecycleBusy = true;
         try
         {
             await StopAutomationBeforeLifecycleChangeAsync();
@@ -278,14 +310,18 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             StatusText = exception.Message;
             AddLog(exception.Message);
         }
+        finally { _previewTouchLifecycleBusy = false; }
     }
 
     private async Task StopAutomationBeforeLifecycleChangeAsync()
     {
-        if (!IsRunning) return;
-        StopRun();
-        while (IsRunning)
-            await Task.Delay(25);
+        if (IsRunning)
+        {
+            StopRun();
+            while (IsRunning)
+                await Task.Delay(25);
+        }
+        await _previewTouches.CancelPendingAsync();
     }
 
     [RelayCommand]
@@ -325,8 +361,10 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             return;
         }
 
+        _previewTouchLifecycleBusy = true;
         try
         {
+            await _previewTouches.CancelPendingAsync();
             var frame = _emulator.CaptureLatestFrame() ?? await _emulator.CaptureFreshFrameAsync();
             UpdatePreview(await Task.Run(frame.EncodePng));
             IsSelectingTemplate = true;
@@ -338,6 +376,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
             StatusText = exception.Message;
             AddLog(exception.Message);
         }
+        finally { _previewTouchLifecycleBusy = false; }
     }
 
     [RelayCommand]
@@ -678,6 +717,8 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         AddLog($"执行设备：FgoAuto 管理的 Android 模拟器；日志：{RunLogPath}");
         try
         {
+            await _previewTouches.CancelPendingAsync();
+            _runCancellation.Token.ThrowIfCancellationRequested();
             await RunAutomaticClickLoopAsync(runSet, _runCancellation.Token);
         }
         catch (OperationCanceledException)
@@ -978,34 +1019,20 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         return (true, string.Empty);
     }
 
-    public async Task SendPreviewTouchAsync(int x, int y, int pressure)
+    public void QueuePreviewTouch(int x, int y, int pressure)
     {
-        if (!_emulator.IsRunning || (pressure > 0 && (IsRunning || !_emulator.HasLiveScreenshotStream)))
+        if (pressure == 0 && (_disposed || _previewTouchLifecycleBusy || !CanOperateEmulator))
+        {
+            // Reset the physical pointer state even when its preview disappeared.
+            _ = _previewTouches.CancelPendingAsync(pointerReleased: true);
             return;
-        var acquired = false;
-        try
-        {
-            await _touchSendGate.WaitAsync();
-            acquired = true;
-            if (_emulator.IsRunning && (!IsRunning || pressure == 0))
-            {
-                var image = LivePreviewImage;
-                if (image is null || _previewNativeWidth <= 0 || _previewNativeHeight <= 0) return;
-                var nativeX = Math.Clamp((int)Math.Round(x * (double)_previewNativeWidth / image.PixelSize.Width), 0, _previewNativeWidth - 1);
-                var nativeY = Math.Clamp((int)Math.Round(y * (double)_previewNativeHeight / image.PixelSize.Height), 0, _previewNativeHeight - 1);
-                await _emulator.SendTouchAsync(nativeX, nativeY, pressure);
-            }
         }
-        catch (Exception exception)
-        {
-            StatusText = $"模拟器触控失败：{exception.Message}";
-            AddLog(StatusText);
-        }
-        finally
-        {
-            if (acquired)
-                _touchSendGate.Release();
-        }
+        if (_disposed || _previewTouchLifecycleBusy || !CanOperateEmulator) return;
+        var image = LivePreviewImage;
+        if (image is null || _previewNativeWidth <= 0 || _previewNativeHeight <= 0) return;
+        var nativeX = Math.Clamp((int)Math.Round(x * (double)_previewNativeWidth / image.PixelSize.Width), 0, _previewNativeWidth - 1);
+        var nativeY = Math.Clamp((int)Math.Round(y * (double)_previewNativeHeight / image.PixelSize.Height), 0, _previewNativeHeight - 1);
+        _previewTouches.Submit(nativeX, nativeY, pressure);
     }
 
     private void OnEmulatorServiceStatusChanged(string status) => Dispatcher.UIThread.Post(() =>
@@ -1017,11 +1044,13 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         OnPropertyChanged(nameof(CanOperateEmulator));
         if (!IsEmulatorRunning)
         {
+            _ = _previewTouches.CancelPendingAsync();
             ClearVideoBitmap();
             LivePreviewStatus = "Android 模拟器未运行";
         }
         else if (!_emulator.HasLiveScreenshotStream && status.Contains("截图流", StringComparison.OrdinalIgnoreCase))
         {
+            _ = _previewTouches.CancelPendingAsync();
             ClearVideoBitmap();
             LivePreviewStatus = status;
         }
@@ -1126,6 +1155,7 @@ public partial class MainViewModel : ViewModelBase, IDisposable
         if (_disposed) return;
         _disposed = true;
         _runCancellation?.Cancel();
+        _previewTouches.Dispose();
         DisposePreview();
         _emulator.FrameAvailable -= OnEmulatorFrameAvailable;
         _emulator.StatusChanged -= OnEmulatorServiceStatusChanged;

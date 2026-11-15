@@ -14,20 +14,20 @@ public partial class MainViewModel
     private volatile bool _previewDisposed;
     private readonly Stopwatch _previewFpsClock = new();
     private readonly object _previewMetricsLock = new();
-    private readonly Queue<double> _renderIntervals = new(240);
+    private readonly FrameStatistics _drawStatistics = new();
     private DispatcherTimer? _previewTimer;
     private int _previewDispatchPending;
-    private long _renderedFrames;
     private long _lastRenderedSequence = -1;
-    private long _lastRenderedAtTimestamp;
+    private long _uploadedFrameSequence = -1, _uploadedFrameReceivedAt;
     private long _previousReceivedFrames;
     private long _previousRenderedFrames;
     private long _lastPerformanceLogTimestamp;
     private int _previewNativeWidth;
     private int _previewNativeHeight;
     private long _loggedReceivedFrames, _loggedRenderedFrames;
-    private long _longRenderIntervals;
-    private double _maxRenderIntervalMs;
+    private long _loggedAllocatedBytes;
+    private TimeSpan _loggedGcPause;
+    private int _loggedGen2Collections;
 
     [ObservableProperty]
     [NotifyPropertyChangedFor(nameof(DisplayedPreviewImage))]
@@ -47,6 +47,7 @@ public partial class MainViewModel
     {
         _previewFpsClock.Start();
         _lastPerformanceLogTimestamp = Stopwatch.GetTimestamp();
+        ResetProcessMetricsBaseline();
         _previewTimer = new DispatcherTimer(DispatcherPriority.Background)
         {
             Interval = TimeSpan.FromSeconds(1),
@@ -78,11 +79,13 @@ public partial class MainViewModel
         using var frame = _emulator.TakeLatestPreviewFrame();
         if (frame is null) return;
 
+        var copyStartedAt = Stopwatch.GetTimestamp();
         if (LivePreviewImage is null || LivePreviewImage.PixelSize != new PixelSize(frame.Width, frame.Height))
         {
             ClearVideoBitmap();
             LivePreviewImage = new WriteableBitmap(new PixelSize(frame.Width, frame.Height), new Vector(96, 96),
                 PixelFormat.Bgra8888, AlphaFormat.Opaque);
+            ScreenSizeText = $"{frame.Width} × {frame.Height}";
         }
         using (var buffer = LivePreviewImage.Lock())
         {
@@ -92,10 +95,16 @@ public partial class MainViewModel
                 for (var y = 0; y < frame.Height; y++)
                     Marshal.Copy(frame.Pixels, y * frame.RowBytes, buffer.Address + y * buffer.RowBytes, frame.RowBytes);
         }
+        _emulator.PreviewStatistics.RecordUiCopy(frame.PreviewReadyAtTimestamp,
+            copyStartedAt, Stopwatch.GetTimestamp());
         _previewNativeWidth = frame.NativeWidth;
         _previewNativeHeight = frame.NativeHeight;
+        lock (_previewMetricsLock)
+        {
+            _uploadedFrameSequence = frame.Sequence;
+            _uploadedFrameReceivedAt = frame.ReceivedAtTimestamp;
+        }
         LivePreviewFrameNumber = frame.Sequence;
-        ScreenSizeText = $"{frame.Width} × {frame.Height}";
     }
 
     /// <summary>Records a distinct frame submitted by the preview control's DrawImage call.</summary>
@@ -105,17 +114,10 @@ public partial class MainViewModel
         lock (_previewMetricsLock)
         {
             if (sequence == _lastRenderedSequence) return;
-            if (_lastRenderedAtTimestamp > 0 && renderedAtTimestamp > _lastRenderedAtTimestamp)
-            {
-                var interval = Stopwatch.GetElapsedTime(_lastRenderedAtTimestamp, renderedAtTimestamp).TotalMilliseconds;
-                if (interval > 50) _longRenderIntervals++;
-                _maxRenderIntervalMs = Math.Max(_maxRenderIntervalMs, interval);
-                if (_renderIntervals.Count == 240) _renderIntervals.Dequeue();
-                _renderIntervals.Enqueue(interval);
-            }
             _lastRenderedSequence = sequence;
-            _lastRenderedAtTimestamp = renderedAtTimestamp;
-            _renderedFrames++;
+            _drawStatistics.Record(sequence, renderedAtTimestamp);
+            if (sequence == _uploadedFrameSequence)
+                _emulator.PreviewStatistics.RecordDraw(_uploadedFrameReceivedAt, renderedAtTimestamp);
         }
     }
 
@@ -126,25 +128,14 @@ public partial class MainViewModel
         var elapsedSeconds = _previewFpsClock.Elapsed.TotalSeconds;
         if (elapsedSeconds < 0.5) return;
 
-        var received = _emulator.FrameStatistics.GetSnapshot();
-        long renderedFrames;
-        double renderIntervalP95;
-        double maxRenderInterval;
-        long longRenderIntervals;
-        lock (_previewMetricsLock)
-        {
-            renderedFrames = _renderedFrames;
-            var intervals = _renderIntervals.ToArray();
-            Array.Sort(intervals);
-            renderIntervalP95 = intervals.Length == 0 ? 0 : intervals[(int)Math.Ceiling(intervals.Length * 0.95) - 1];
-            maxRenderInterval = _maxRenderIntervalMs;
-            longRenderIntervals = _longRenderIntervals;
-        }
+        var now = Stopwatch.GetTimestamp();
+        var received = _emulator.FrameStatistics.GetSnapshot(now);
+        var drawn = _drawStatistics.GetSnapshot(now);
+        var renderedFrames = drawn.ReceivedFrames;
         var receivedInPeriod = received.ReceivedFrames >= _previousReceivedFrames
             ? received.ReceivedFrames - _previousReceivedFrames : received.ReceivedFrames;
         var receiveFps = receivedInPeriod / elapsedSeconds;
-        var drawFps = (renderedFrames - _previousRenderedFrames) / elapsedSeconds;
-        var now = Stopwatch.GetTimestamp();
+        var drawFps = Math.Max(0, renderedFrames - _previousRenderedFrames) / elapsedSeconds;
         var ageMs = received.LastReceivedAtTimestamp > 0
             ? Stopwatch.GetElapsedTime(received.LastReceivedAtTimestamp, now).TotalMilliseconds : 0;
         if (!IsEmulatorRunning)
@@ -153,24 +144,42 @@ public partial class MainViewModel
             _lastPerformanceLogTimestamp = now;
             _loggedReceivedFrames = received.ReceivedFrames;
             _loggedRenderedFrames = renderedFrames;
+            ResetProcessMetricsBaseline();
         }
         else if (!_emulator.HasLiveScreenshotStream)
             LivePreviewStatus = "模拟器截图流中断，请重启模拟器";
         else if (LivePreviewImage is { } image)
         {
             var waiting = receivedInPeriod == 0 && ageMs >= 1000 ? "等待新画面 · " : string.Empty;
-            LivePreviewStatus = $"{waiting}接收 {receiveFps:F1} / 绘制 {drawFps:F1} 帧/秒 · {image.PixelSize.Width} × {image.PixelSize.Height}"
-                + $" · P95 间隔 {received.ReceiveIntervalP95Ms:F1} / {renderIntervalP95:F1} ms · 距新帧 {ageMs:F0} ms";
+            var intervals = received.WindowIntervalSamples > 0 && drawn.WindowIntervalSamples > 0
+                ? $"{received.ReceiveIntervalP95Ms:F1}/{drawn.ReceiveIntervalP95Ms:F1} ms" : "暂无样本";
+            LivePreviewStatus = $"{waiting}接收 {receiveFps:F1} / 绘制提交 {drawFps:F1} 帧/秒 · {image.PixelSize.Width} × {image.PixelSize.Height}"
+                + $" · 近5s间隔P95 {intervals} · 距新帧 {ageMs:F0} ms";
             if (!IsSelectingTemplate && Stopwatch.GetElapsedTime(_lastPerformanceLogTimestamp, now).TotalSeconds >= 5)
             {
                 var logSeconds = Stopwatch.GetElapsedTime(_lastPerformanceLogTimestamp, now).TotalSeconds;
                 var receivedCount = received.ReceivedFrames >= _loggedReceivedFrames ? received.ReceivedFrames - _loggedReceivedFrames : received.ReceivedFrames;
                 var loggedReceiveFps = receivedCount / logSeconds;
                 var loggedDrawFps = (renderedFrames - _loggedRenderedFrames) / logSeconds;
+                var stages = _emulator.PreviewStatistics.GetSnapshot(now);
+                var allocatedBytes = GC.GetTotalAllocatedBytes(precise: false);
+                var gcPause = GC.GetTotalPauseDuration();
+                var gen2Collections = GC.CollectionCount(2);
+                var touch = _previewTouches.GetSnapshot();
+                var sourceDelivery = received.SourceTimestampSamples > 0
+                    ? $"{received.EstimatedGenerationToReceiveP95Ms:F1} ms/{received.SourceTimestampSamples}样本"
+                    : "暂无有效源时间戳样本";
                 AddLog($"预览性能（近 {logSeconds:F1}s）：接收 {loggedReceiveFps:F1} / 绘制提交 {loggedDrawFps:F1} 帧/秒；{image.PixelSize.Width} × {image.PixelSize.Height}；"
-                    + $"接收/绘制间隔 P95 {received.ReceiveIntervalP95Ms:F1}/{renderIntervalP95:F1} ms；距上次收帧 {ageMs:F0} ms；源序号缺口累计 {received.SourceSkippedFrames}。"
-                    + $" 会话最大新帧间隔 {received.MaxReceiveIntervalMs:F1}/{maxRenderInterval:F1} ms；超过 50ms 次数 {received.LongReceiveIntervals}/{longRenderIntervals}（含静止间隔）。"
+                    + $"近5s接收/绘制间隔 P95 {intervals}（样本 {received.WindowIntervalSamples}/{drawn.WindowIntervalSamples}）；距上次收帧 {ageMs:F0} ms；源序号缺口累计 {received.SourceSkippedFrames}。"
+                    + $" 模拟器估计图像生成至收到完整帧P95 {sourceDelivery}（近5s，非游戏源帧时间）。"
+                    + $" 收帧后耗时P95：转换 {FormatTiming(stages.Conversion)}，收帧至预览就绪 {FormatTiming(stages.ReceiveToPreview)}，UI等待 {FormatTiming(stages.PreviewToUi)}，位图复制 {FormatTiming(stages.UiCopy)}，收帧至绘制提交 {FormatTiming(stages.ReceiveToDraw)}（近5s，不含模拟器渲染/截图和显示器呈现）。"
+                    + $" 进程分配 {Math.Max(0, allocatedBytes - _loggedAllocatedBytes) / logSeconds / 1_000_000d:F1} MB/s，GC暂停 {Math.Max(0, (gcPause - _loggedGcPause).TotalMilliseconds):F1} ms，Gen2 {Math.Max(0, gen2Collections - _loggedGen2Collections)} 次。"
+                    + $" 触控RPC P95 {touch.RpcP95Ms:F1} ms（最近120次），待处理手势 {touch.PendingGestures}，累计合并移动 {touch.CoalescedMoves}，丢弃过期/超额手势 {touch.DiscardedGestures}。"
+                    + $" 会话最大新帧间隔 {received.MaxReceiveIntervalMs:F1}/{drawn.MaxReceiveIntervalMs:F1} ms；超过50ms次数 {received.LongReceiveIntervals}/{drawn.LongReceiveIntervals}；以上新帧速率与间隔含静止时间，不是游戏FPS。"
                     + (waiting.Length > 0 ? " 等待新画面，静止时无新帧不代表卡顿。" : string.Empty));
+                _loggedAllocatedBytes = allocatedBytes;
+                _loggedGcPause = gcPause;
+                _loggedGen2Collections = gen2Collections;
                 _loggedReceivedFrames = received.ReceivedFrames;
                 _loggedRenderedFrames = renderedFrames;
                 _lastPerformanceLogTimestamp = now;
@@ -186,13 +195,7 @@ public partial class MainViewModel
     partial void OnIsSelectingTemplateChanged(bool value)
     {
         // A fixed selection image is excluded from live drawing statistics.
-        lock (_previewMetricsLock)
-        {
-            _lastRenderedAtTimestamp = 0;
-            _renderIntervals.Clear();
-            _maxRenderIntervalMs = 0;
-            _longRenderIntervals = 0;
-        }
+        _drawStatistics.ResetIntervals();
         if (!value)
             RenderLatestEmulatorFrame();
     }
@@ -205,12 +208,21 @@ public partial class MainViewModel
         lock (_previewMetricsLock)
         {
             _lastRenderedSequence = -1;
-            _lastRenderedAtTimestamp = 0;
-            _renderIntervals.Clear();
-            _maxRenderIntervalMs = 0;
-            _longRenderIntervals = 0;
+            _uploadedFrameSequence = -1;
+            _uploadedFrameReceivedAt = 0;
+            _drawStatistics.ResetIntervals();
         }
         previous?.Dispose();
+    }
+
+    private static string FormatTiming(TimingStatisticsSnapshot timing) =>
+        timing.Samples > 0 ? $"{timing.P95Ms:F1} ms/{timing.Samples}样本" : "暂无样本";
+
+    private void ResetProcessMetricsBaseline()
+    {
+        _loggedAllocatedBytes = GC.GetTotalAllocatedBytes(precise: false);
+        _loggedGcPause = GC.GetTotalPauseDuration();
+        _loggedGen2Collections = GC.CollectionCount(2);
     }
 
     private void DisposePreview()
