@@ -1,0 +1,247 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:FgoAuto.ViewModels"
+        xmlns:models="using:FgoAuto.Models"
+        xmlns:controls="using:FgoAuto.Controls"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        mc:Ignorable="d" d:DesignWidth="1500" d:DesignHeight="900"
+        x:Class="FgoAuto.Views.MainWindow"
+        x:DataType="vm:MainViewModel"
+        Title="FGO 自动点击"
+        Icon="avares://FgoAuto/Assets/platform.ico"
+        Width="1080" Height="780" MinWidth="980" MinHeight="680"
+        Background="#0B1220" Foreground="#E2E8F0">
+
+    <Window.Styles>
+        <Style Selector="Border.panel">
+            <Setter Property="Background" Value="#111B2D" />
+            <Setter Property="BorderBrush" Value="#24334A" />
+            <Setter Property="BorderThickness" Value="1" />
+            <Setter Property="CornerRadius" Value="14" />
+            <Setter Property="Padding" Value="14" />
+        </Style>
+        <Style Selector="TextBlock.muted">
+            <Setter Property="Foreground" Value="#94A3B8" />
+        </Style>
+        <Style Selector="Button.primary">
+            <Setter Property="Background" Value="#2563EB" />
+            <Setter Property="Foreground" Value="White" />
+            <Setter Property="Padding" Value="14,9" />
+        </Style>
+        <Style Selector="Button.secondary">
+            <Setter Property="Background" Value="#1E293B" />
+            <Setter Property="Foreground" Value="#E2E8F0" />
+            <Setter Property="Padding" Value="10,7" />
+        </Style>
+        <Style Selector="Button.stop">
+            <Setter Property="Background" Value="#7F1D1D" />
+            <Setter Property="Foreground" Value="#FEE2E2" />
+            <Setter Property="Padding" Value="14,9" />
+        </Style>
+    </Window.Styles>
+
+    <Grid RowDefinitions="Auto,Auto,Auto,*" Margin="20" RowSpacing="14">
+        <Grid Grid.Row="0" ColumnDefinitions="*,Auto" VerticalAlignment="Center">
+            <StackPanel Spacing="3">
+                <TextBlock Text="FGO 自动点击" FontSize="25" FontWeight="Bold" />
+                <TextBlock Text="规则无先后顺序 · 命中目标自动点击 · 任一规则达限或按停止结束" Classes="muted" />
+            </StackPanel>
+            <Border Grid.Column="1" Background="#172554" CornerRadius="9" Padding="12,7" VerticalAlignment="Center">
+                <TextBlock Text="{Binding AutomationStateText}" Foreground="#BFDBFE" FontSize="12" TextWrapping="Wrap" MaxWidth="280" />
+            </Border>
+        </Grid>
+
+        <Border Grid.Row="1" Classes="panel" Padding="12">
+            <StackPanel Spacing="7">
+                <Grid ColumnDefinitions="Auto,Auto,Auto,*" ColumnSpacing="8" VerticalAlignment="Center">
+                    <TextBlock Text="Android 模拟器" VerticalAlignment="Center" Foreground="#94A3B8" />
+                    <Button Grid.Column="1" Classes="secondary" Command="{Binding OpenAndroidSdkLicenseCommand}" Content="Android SDK 许可" />
+                    <Button Grid.Column="2" Classes="secondary" Command="{Binding OpenGooglePlayTermsCommand}" Content="Google Play 条款" />
+                    <CheckBox Grid.Column="3" Content="我已阅读并接受 Android SDK 与 Google Play 相关许可" IsChecked="{Binding AreRuntimeLicensesAccepted}" VerticalAlignment="Center" />
+                </Grid>
+                <WrapPanel ItemSpacing="8" LineSpacing="6">
+                    <Button Classes="secondary" Command="{Binding PrepareEmulatorCommand}" Content="{Binding PrepareEmulatorButtonText}" IsEnabled="{Binding CanPrepareEmulator}" />
+                    <Button Classes="primary" Command="{Binding StartEmulatorCommand}" Content="启动模拟器" IsEnabled="{Binding IsEmulatorPrepared}" />
+                    <Button Classes="secondary" Command="{Binding RestartEmulatorCommand}" Content="重启模拟器" IsEnabled="{Binding IsEmulatorPrepared}" />
+                    <Button Classes="secondary" Command="{Binding StopEmulatorCommand}" Content="停止模拟器" IsEnabled="{Binding IsEmulatorRunning}" />
+                    <Button Classes="secondary" Command="{Binding SelectTemplateCommand}" Content="框选图片目标" IsEnabled="{Binding CanOperateEmulator}" />
+                    <CheckBox Content="720p 游戏性能模式" IsChecked="{Binding UsePerformanceMode}" IsEnabled="{Binding !IsRunning}" VerticalAlignment="Center"
+                              ToolTip.Tip="重启模拟器后生效。将 Android 和游戏实际渲染降为 1280×720，降低图形负担；旧模板和点击坐标自动换算。" />
+                </WrapPanel>
+                <TextBlock Text="{Binding StatusText}" Classes="muted" Margin="2,0,0,0" TextWrapping="Wrap" />
+                <Grid ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto" ColumnSpacing="8" IsVisible="{Binding IsPreparingEmulator}">
+                    <TextBlock Text="{Binding PrepareProgressText}" Classes="muted" TextWrapping="Wrap" />
+                    <TextBlock Grid.Column="1" Text="{Binding PrepareProgressValue, StringFormat={}{0:F0}%}" Classes="muted" VerticalAlignment="Center"
+                               IsVisible="{Binding !IsPrepareProgressIndeterminate}" />
+                    <ProgressBar Grid.Row="1" Grid.ColumnSpan="2" Minimum="0" Maximum="100" Value="{Binding PrepareProgressValue}"
+                                 IsIndeterminate="{Binding IsPrepareProgressIndeterminate}" Height="8" Margin="0,3,0,0" />
+                </Grid>
+            </StackPanel>
+        </Border>
+
+        <Border Grid.Row="2" Classes="panel" Padding="12">
+            <Grid ColumnDefinitions="Auto,230,*,Auto" ColumnSpacing="10" IsEnabled="{Binding !IsRunning}">
+                <TextBlock Text="规则套装" Foreground="#94A3B8" VerticalAlignment="Center" />
+                <ComboBox Grid.Column="1" ItemsSource="{Binding RuleSets}" SelectedItem="{Binding SelectedRuleSet}" VerticalAlignment="Center">
+                    <ComboBox.ItemTemplate>
+                        <DataTemplate x:DataType="models:RuleSet">
+                            <TextBlock Text="{Binding Display}" />
+                        </DataTemplate>
+                    </ComboBox.ItemTemplate>
+                </ComboBox>
+                <WrapPanel Grid.Column="2" Orientation="Horizontal" ItemSpacing="6" VerticalAlignment="Center">
+                    <TextBox Width="150" Text="{Binding SelectedRuleSetName}" PlaceholderText="套装名称" />
+                    <Button Classes="secondary" Command="{Binding RenameRuleSetCommand}" Content="改名" />
+                    <Button Classes="secondary" Command="{Binding CreateRuleSetCommand}" Content="新建" ToolTip.Tip="新建空套装，再从图片目标库添加规则。" />
+                    <Button Classes="secondary" Command="{Binding DuplicateRuleSetCommand}" Content="复制" ToolTip.Tip="复制当前套装，副本中的规则设置可以独立修改。" />
+                    <Button Classes="secondary" Command="{Binding DeleteRuleSetCommand}" Content="删除" ToolTip.Tip="删除当前套装，保留共用的图片目标素材。" />
+                </WrapPanel>
+                <StackPanel Grid.Column="3" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                    <Button Classes="secondary" Command="{Binding SaveRulesCommand}" Content="保存全部套装" />
+                    <Button Classes="secondary" Command="{Binding LoadRulesCommand}" Content="重新载入" ToolTip.Tip="从磁盘恢复全部套装，覆盖当前未保存的编辑。" />
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <Grid Grid.Row="3" ColumnDefinitions="280,360,*" ColumnSpacing="14">
+            <Grid Grid.Column="0" RowDefinitions="*,150" RowSpacing="12">
+                <Border Classes="panel">
+                    <Grid RowDefinitions="Auto,*,Auto,Auto,Auto" RowSpacing="8">
+                        <StackPanel Grid.Row="0" Spacing="3">
+                            <TextBlock Text="图片目标库" FontSize="16" FontWeight="SemiBold" />
+                            <TextBlock Text="素材由各套装共用，选中后添加到当前套装。" Classes="muted" FontSize="12" TextWrapping="Wrap" />
+                            <TextBlock Text="{Binding TemplateSelectionHint}" Classes="muted" FontSize="11" TextWrapping="Wrap" />
+                        </StackPanel>
+
+                        <ListBox Grid.Row="1" ItemsSource="{Binding ImageTargets}" SelectedItem="{Binding SelectedImageTarget}"
+                                 Background="#0B1220" BorderBrush="#24334A" BorderThickness="1">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate x:DataType="models:ImageMatchTarget">
+                                    <StackPanel Orientation="Horizontal" Spacing="8" Margin="4,5">
+                                        <Border Width="72" Height="44" Background="#080E18" BorderBrush="#24334A" BorderThickness="1" CornerRadius="5" ClipToBounds="True">
+                                            <Image Source="{Binding Thumbnail}" Stretch="Uniform" />
+                                        </Border>
+                                        <TextBlock Text="{Binding Display}" Foreground="#E2E8F0" FontSize="12" VerticalAlignment="Center" TextWrapping="Wrap" />
+                                    </StackPanel>
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+
+                        <Grid Grid.Row="2" ColumnDefinitions="Auto,*,Auto" ColumnSpacing="6" VerticalAlignment="Center">
+                            <TextBlock Text="名称" Classes="muted" VerticalAlignment="Center" />
+                            <TextBox Grid.Column="1" Text="{Binding SelectedImageTargetName}" PlaceholderText="例如：战斗开始" />
+                            <Button Grid.Column="2" Classes="secondary" Command="{Binding RenameSelectedImageTargetCommand}" Content="改名" />
+                        </Grid>
+
+                        <WrapPanel Grid.Row="3" Orientation="Horizontal" ItemSpacing="6">
+                            <Button Classes="secondary" Command="{Binding TestSelectedImageMatchCommand}" Content="测试匹配" />
+                            <Button Classes="secondary" Command="{Binding DeleteSelectedImageTargetCommand}" Content="删除目标" ToolTip.Tip="删除图片及全部套装中引用它的规则。" />
+                            <Button Classes="secondary" Command="{Binding CancelTemplateSelectionCommand}" Content="取消框选" />
+                        </WrapPanel>
+
+                        <Grid Grid.Row="4" ColumnDefinitions="*,*" ColumnSpacing="6">
+                            <Button Classes="primary" Command="{Binding AddSelectedImageRuleCommand}" Content="添加到套装" HorizontalAlignment="Stretch" />
+                            <Button Grid.Column="1" Classes="secondary" Command="{Binding AddSelectedNoblePhantasmRuleCommand}" Content="添加宝具卡" HorizontalAlignment="Stretch"
+                                    ToolTip.Tip="框选上方宝具的固定图案后添加；选卡时优先使用宝具，普通卡补齐三张。" />
+                        </Grid>
+                    </Grid>
+                </Border>
+
+                <Border Grid.Row="1" Classes="panel" Padding="12">
+                    <Grid RowDefinitions="Auto,*" RowSpacing="6">
+                        <TextBlock Text="运行记录" FontWeight="SemiBold" />
+                        <ListBox Grid.Row="1" ItemsSource="{Binding Logs}" Background="Transparent" BorderThickness="0">
+                            <ListBox.ItemTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding}" Foreground="#CBD5E1" FontSize="11" TextWrapping="Wrap" Margin="2,2" />
+                                </DataTemplate>
+                            </ListBox.ItemTemplate>
+                        </ListBox>
+                    </Grid>
+                </Border>
+            </Grid>
+
+            <Border Grid.Column="1" Classes="panel" Padding="12">
+                <Grid RowDefinitions="Auto,*,Auto,Auto" RowSpacing="9">
+                    <StackPanel Grid.Row="0" Spacing="3">
+                        <TextBlock Text="当前套装的点击规则" FontSize="16" FontWeight="SemiBold" />
+                        <TextBlock Text="宝具优先，普通卡随机补齐三张，每张一次。普通按钮单点，列表可选最上方。" Classes="muted" FontSize="12" TextWrapping="Wrap" />
+                    </StackPanel>
+
+                    <ListBox Grid.Row="1" ItemsSource="{Binding ClickRules}" SelectedItem="{Binding SelectedClickRule}"
+                             Background="#0B1220" BorderBrush="#24334A" BorderThickness="1">
+                        <ListBox.ItemTemplate>
+                            <DataTemplate x:DataType="models:ImageClickRule">
+                                <Border Background="#111B2D" CornerRadius="8" Padding="6" Margin="3">
+                                    <Grid ColumnDefinitions="92,*" ColumnSpacing="8">
+                                        <Border Width="88" Height="60" Background="#080E18" BorderBrush="#24334A" BorderThickness="1" CornerRadius="5" ClipToBounds="True" VerticalAlignment="Center">
+                                            <Image Source="{Binding Thumbnail}" Stretch="Uniform" />
+                                        </Border>
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="4">
+                                            <TextBlock Text="{Binding Display}" Foreground="#E2E8F0" FontSize="12" TextWrapping="Wrap" />
+                                            <TextBlock Text="{Binding TriggerCountDisplay}" Classes="muted" FontSize="11" TextWrapping="Wrap" />
+                                        </StackPanel>
+                                    </Grid>
+                                </Border>
+                            </DataTemplate>
+                        </ListBox.ItemTemplate>
+                    </ListBox>
+
+                    <StackPanel Grid.Row="2" Spacing="8" IsEnabled="{Binding !IsRunning}">
+                        <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8">
+                            <TextBlock Text="匹配阈值" Classes="muted" VerticalAlignment="Center" />
+                            <TextBox Grid.Column="1" Width="90" HorizontalAlignment="Left" Text="{Binding SelectedRuleThreshold}" PlaceholderText="0.82" />
+                            <Button Grid.Column="2" Classes="secondary" Command="{Binding DeleteSelectedClickRuleCommand}" Content="移除规则" />
+                        </Grid>
+                        <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8">
+                            <TextBlock Text="触发次数上限" Classes="muted" VerticalAlignment="Center" />
+                            <TextBox Grid.Column="1" Text="{Binding SelectedRuleTriggerLimit}" PlaceholderText="留空 = 无限次" />
+                            <Button Grid.Column="2" Classes="secondary" Command="{Binding ApplySelectedRuleSettingsCommand}" Content="应用" />
+                        </Grid>
+                        <Grid ColumnDefinitions="Auto,*" ColumnSpacing="8">
+                            <TextBlock Text="执行方式" Classes="muted" VerticalAlignment="Center" />
+                            <ComboBox Grid.Column="1" ItemsSource="{Binding RuleModeNames}" SelectedIndex="{Binding SelectedRuleModeIndex}" HorizontalAlignment="Stretch" />
+                        </Grid>
+                        <TextBlock Text="设置后点应用；宝具优先、普通卡补齐三张。任一规则达次数上限即停止全部，每次开始重新计数。"
+                                   Classes="muted" FontSize="11" TextWrapping="Wrap" />
+                    </StackPanel>
+
+                    <Grid Grid.Row="3" ColumnDefinitions="*,*" ColumnSpacing="8">
+                        <Button Classes="primary" Command="{Binding StartRunCommand}" Content="{Binding StartRunButtonText}" />
+                        <Button Grid.Column="1" Classes="stop" Command="{Binding StopRunCommand}" Content="停止" IsEnabled="{Binding IsRunning}" />
+                    </Grid>
+                </Grid>
+            </Border>
+
+            <Border Grid.Column="2" Classes="panel" Padding="12">
+                <Grid RowDefinitions="Auto,*" RowSpacing="9">
+                    <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
+                        <StackPanel Spacing="3">
+                            <TextBlock Text="Android 模拟器预览" FontSize="16" FontWeight="SemiBold" />
+                            <TextBlock Text="{Binding PreviewStatusText}" Foreground="#67E8F9" FontSize="12" TextWrapping="Wrap" />
+                        </StackPanel>
+                        <TextBlock Grid.Column="1" Text="{Binding ScreenSizeText}" Classes="muted" VerticalAlignment="Center" IsVisible="{Binding IsSelectingTemplate}" />
+                        <TextBlock Grid.Column="2" Text="点击或拖动此处操作模拟器" Classes="muted" FontSize="11" VerticalAlignment="Center" />
+                    </Grid>
+
+                    <Border Grid.Row="1" Background="#080E18" BorderBrush="#24334A" BorderThickness="1" CornerRadius="10" ClipToBounds="True">
+                        <Grid>
+                            <TextBlock Foreground="#64748B" TextAlignment="Center" HorizontalAlignment="Center" VerticalAlignment="Center"
+                                       IsVisible="{Binding !IsEmulatorRunning}">
+                                <Run Text="启动模拟器后会显示实时画面" />
+                                <LineBreak />
+                                <Run Text="首次启动后请在此登录并安装 FGO" />
+                            </TextBlock>
+                            <controls:ScreenshotPreview Source="{Binding DisplayedPreviewImage}" IsSelecting="{Binding IsSelectingTemplate}" IsInteractive="{Binding CanOperateEmulator}" FrameNumber="{Binding LivePreviewFrameNumber}"
+                                                        HorizontalAlignment="Stretch" VerticalAlignment="Stretch" ClipToBounds="True"
+                                                        FrameRendered="OnPreviewFrameRendered" SelectionUpdated="OnPreviewSelectionUpdated"
+                                                        SelectionCompleted="OnPreviewSelectionCompleted"
+                                                        TouchUpdated="OnPreviewTouchUpdated" />
+                        </Grid>
+                    </Border>
+                </Grid>
+            </Border>
+        </Grid>
+    </Grid>
+</Window>
